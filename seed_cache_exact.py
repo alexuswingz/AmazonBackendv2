@@ -28,8 +28,12 @@ from app.algorithms.algorithms_tps import (
 )
 from sqlalchemy import func
 
-# PostgreSQL connection
-DATABASE_URL = "postgresql://postgres:JMVZWnrhWpFToCzqgkEwCPhSBHCvUMuH@caboose.proxy.rlwy.net:54152/railway"
+# PostgreSQL connection - use environment variable
+DATABASE_URL = os.environ.get('DATABASE_URL')
+if not DATABASE_URL:
+    print("ERROR: Set DATABASE_URL environment variable")
+    print("Example: set DATABASE_URL=postgresql://user:pass@host:port/db")
+    sys.exit(1)
 
 print("=" * 60)
 print("EXACT FORECAST CACHE SEEDER")

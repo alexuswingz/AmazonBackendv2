@@ -12,8 +12,13 @@ from datetime import datetime, date, timedelta
 from sqlalchemy import create_engine, text
 import pandas as pd
 
-# PostgreSQL connection
-DATABASE_URL = "postgresql://postgres:JMVZWnrhWpFToCzqgkEwCPhSBHCvUMuH@caboose.proxy.rlwy.net:54152/railway"
+# PostgreSQL connection - use environment variable
+import os
+DATABASE_URL = os.environ.get('DATABASE_URL')
+if not DATABASE_URL:
+    print("ERROR: Set DATABASE_URL environment variable")
+    print("Example: set DATABASE_URL=postgresql://user:pass@host:port/db")
+    sys.exit(1)
 
 print("=" * 60)
 print("FAST FORECAST CACHE SEEDER")
