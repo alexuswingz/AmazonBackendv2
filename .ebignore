@@ -1,0 +1,15 @@
+# Ignore for Elastic Beanstalk deployment
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+.env
+.venv
+venv/
+*.db
+*.sqlite
+test_*.py
+debug_*.py
+find_products.py
+seed_data.py
