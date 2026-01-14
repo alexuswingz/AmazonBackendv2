@@ -180,7 +180,7 @@ def get_awd_by_asin(asin):
 @api_bp.route('/forecast/all', methods=['GET'])
 def get_all_forecasts():
     """
-    Get forecast summary for ALL products - FAST (reads from cache).
+    Get forecast summary for ALL products - calculates on-the-fly for 100% accuracy.
     
     Returns: Brand, Product, Size, Units to Make for ALL products (no pagination).
     Sorted by DOI Total (ascending) - lowest inventory days first.
@@ -189,15 +189,84 @@ def get_all_forecasts():
         - brand: Filter by brand name (optional)
         - sort: Sort field - 'doi' (default), 'units', 'product', 'fba'
         - order: 'asc' (default) or 'desc'
+        - use_cache: 'true' to use cached values (faster but may be stale)
     """
-    from app.services.cache_service import cache_service
+    from app.services.forecast_service import forecast_service
+    from app.algorithms.algorithms_tps import (
+        calculate_forecast_18m_plus as tps_18m,
+        DEFAULT_SETTINGS
+    )
+    from datetime import date
     
     brand_filter = request.args.get('brand', None)
     sort_by = request.args.get('sort', 'doi')
     order = request.args.get('order', 'asc')
+    use_cache = request.args.get('use_cache', 'false').lower() == 'true'
     
-    # Read from cache - INSTANT for 1000+ products
-    forecasts = cache_service.get_all_cached_forecasts(brand_filter)
+    # If cache requested, use cache service
+    if use_cache:
+        from app.services.cache_service import cache_service
+        forecasts = cache_service.get_all_cached_forecasts(brand_filter)
+        cache_stats = cache_service.get_cache_stats()
+    else:
+        # Calculate on-the-fly for 100% accuracy
+        query = Product.query
+        if brand_filter:
+            query = query.filter(Product.brand.ilike(f'%{brand_filter}%'))
+        
+        products = query.all()
+        today = date.today()
+        forecasts = []
+        
+        for product in products:
+            asin = product.asin
+            
+            try:
+                # Get first sale date
+                first_sale = db.session.query(func.min(UnitsSold.week_date)).filter(
+                    UnitsSold.asin == asin, UnitsSold.units > 0
+                ).scalar()
+                
+                if not first_sale:
+                    continue
+                
+                # Get sales data
+                sales = UnitsSold.query.filter_by(asin=asin).order_by(UnitsSold.week_date).all()
+                if len(sales) < 4:
+                    continue
+                
+                units_data = [{'week_end': s.week_date, 'units': s.units} for s in sales]
+                
+                # Get inventory
+                inventory = forecast_service.get_inventory_levels(asin)
+                
+                # Settings
+                settings = DEFAULT_SETTINGS.copy()
+                settings['total_inventory'] = inventory.total_inventory
+                settings['fba_available'] = inventory.fba_available
+                
+                # Calculate age and algorithm
+                age_days = (today - first_sale).days
+                age_months = age_days / 30.44
+                algorithm = "18m+" if age_months >= 18 else ("6-18m" if age_months >= 6 else "0-6m")
+                
+                # Run TPS algorithm
+                result = tps_18m(units_data, today, settings)
+                
+                forecasts.append({
+                    'brand': product.brand or 'TPS Plant Foods',
+                    'product': product.product_name,
+                    'size': product.size,
+                    'asin': asin,
+                    'units_to_make': result['units_to_make'],
+                    'doi_total_days': round(result['doi_total_days'], 0),
+                    'doi_fba_days': round(result['doi_fba_days'], 0),
+                    'algorithm': algorithm
+                })
+            except:
+                pass
+        
+        cache_stats = {'source': 'live_calculation', 'products_calculated': len(forecasts)}
     
     # Sort by DOI (or other field)
     sort_key = {
@@ -210,13 +279,11 @@ def get_all_forecasts():
     reverse = (order == 'desc')
     forecasts.sort(key=lambda x: (x.get(sort_key) or 0) if sort_key != 'product' else (x.get(sort_key) or ''), reverse=reverse)
     
-    cache_stats = cache_service.get_cache_stats()
-    
     return jsonify({
         'forecasts': forecasts,
         'total': len(forecasts),
         'sort': {'field': sort_by, 'order': order},
-        'cache_info': cache_stats
+        'info': cache_stats
     })
 
 
