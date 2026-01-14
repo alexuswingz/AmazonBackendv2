@@ -450,3 +450,141 @@ def calculate_forecast_tps(asin):
     result = forecast_service.run_forecast_tps(asin, custom_settings if custom_settings else None)
     
     return jsonify(result)
+
+
+@api_bp.route('/forecast/all', methods=['GET'])
+def get_all_forecasts():
+    """
+    Get forecast summary for ALL products - table view.
+    
+    Returns: Brand, Product, Size, Units to Make for every product.
+    
+    Query params:
+        - brand: Filter by brand name (optional)
+        - page: Page number (default: 1)
+        - per_page: Items per page (default: 100, max: 500)
+    """
+    from app.services.forecast_service import forecast_service
+    from app.algorithms.algorithms_tps import (
+        calculate_forecast_18m_plus as tps_18m,
+        calculate_forecast_6_18m as tps_6_18m,
+        calculate_forecast_0_6m_exact as tps_0_6m,
+        DEFAULT_SETTINGS
+    )
+    from datetime import date
+    
+    # Pagination params
+    page = request.args.get('page', 1, type=int)
+    per_page = min(request.args.get('per_page', 100, type=int), 500)
+    brand_filter = request.args.get('brand', None)
+    
+    # Query products with pagination
+    query = Product.query
+    if brand_filter:
+        query = query.filter(Product.brand.ilike(f'%{brand_filter}%'))
+    
+    pagination = query.paginate(page=page, per_page=per_page, error_out=False)
+    products = pagination.items
+    
+    results = []
+    today = date.today()
+    
+    for product in products:
+        asin = product.asin
+        
+        try:
+            # Get product age
+            first_sale = db.session.query(func.min(UnitsSold.week_date)).filter(
+                UnitsSold.asin == asin, UnitsSold.units > 0
+            ).scalar()
+            
+            if not first_sale:
+                results.append({
+                    'brand': product.brand or 'TPS Plant Foods',
+                    'product': product.product_name,
+                    'size': product.size,
+                    'asin': asin,
+                    'units_to_make': 0,
+                    'algorithm': 'N/A',
+                    'error': 'No sales history'
+                })
+                continue
+            
+            age_days = (today - first_sale).days
+            age_months = age_days / 30.44
+            
+            # Determine algorithm
+            if age_months >= 18:
+                algorithm = "18m+"
+            elif age_months >= 6:
+                algorithm = "6-18m"
+            else:
+                algorithm = "0-6m"
+            
+            # Get sales data
+            sales = UnitsSold.query.filter_by(asin=asin).order_by(UnitsSold.week_date).all()
+            units_data = [{'week_end': s.week_date, 'units': s.units} for s in sales]
+            
+            if len(units_data) < 4:
+                results.append({
+                    'brand': product.brand or 'TPS Plant Foods',
+                    'product': product.product_name,
+                    'size': product.size,
+                    'asin': asin,
+                    'units_to_make': 0,
+                    'algorithm': algorithm,
+                    'error': 'Insufficient data'
+                })
+                continue
+            
+            # Get inventory
+            inventory = forecast_service.get_inventory_levels(asin)
+            
+            # Settings
+            settings = DEFAULT_SETTINGS.copy()
+            settings['total_inventory'] = inventory.total_inventory
+            settings['fba_available'] = inventory.fba_available
+            
+            # Run appropriate algorithm
+            if algorithm == "18m+":
+                result = tps_18m(units_data, today, settings)
+            elif algorithm == "6-18m":
+                from app.models import Seasonality
+                seasonality = Seasonality.query.all()
+                seasonality_data = [{'week_of_year': s.week_of_year, 'seasonality_index': s.seasonality_index} for s in seasonality]
+                result = tps_6_18m(units_data, today, settings, seasonality_data)
+            else:
+                from app.models import Seasonality
+                seasonality = Seasonality.query.all()
+                seasonality_data = [{'week_of_year': s.week_of_year, 'seasonality_index': s.seasonality_index} for s in seasonality]
+                result = tps_0_6m(units_data, today, settings, seasonality_data)
+            
+            results.append({
+                'brand': product.brand or 'TPS Plant Foods',
+                'product': product.product_name,
+                'size': product.size,
+                'asin': asin,
+                'units_to_make': result['units_to_make'],
+                'algorithm': algorithm
+            })
+            
+        except Exception as e:
+            results.append({
+                'brand': product.brand or 'TPS Plant Foods',
+                'product': product.product_name,
+                'size': product.size,
+                'asin': asin,
+                'units_to_make': 0,
+                'algorithm': 'Error',
+                'error': str(e)[:100]
+            })
+    
+    return jsonify({
+        'forecasts': results,
+        'pagination': {
+            'page': page,
+            'per_page': per_page,
+            'total_products': pagination.total,
+            'total_pages': pagination.pages
+        }
+    })
