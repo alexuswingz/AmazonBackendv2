@@ -738,11 +738,17 @@ def get_forecast_chart(asin):
     awd_outbound = sum(a.outbound_to_fba_units or 0 for a in awd_records)
     awd_reserved = sum(a.reserved_in_awd_units or 0 for a in awd_records)
     
-    # Get label inventory
-    label = LabelInventory.query.filter_by(asin=asin).first()
-    label_inventory = label.label_inventory if label else 0
-    label_id = label.label_id if label else None
-    label_status = label.label_status if label else None
+    # Get label inventory (with error handling in case table doesn't exist)
+    try:
+        label = LabelInventory.query.filter_by(asin=asin).first()
+        label_inventory = label.label_inventory if label else 0
+        label_id = label.label_id if label else None
+        label_status = label.label_status if label else None
+    except Exception as e:
+        print(f"Warning: Could not query label inventory: {e}")
+        label_inventory = 0
+        label_id = None
+        label_status = None
     
     # Calculate total inventory
     total_inventory = fba_total + awd_total
