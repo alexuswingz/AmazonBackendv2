@@ -775,8 +775,15 @@ def get_forecast_chart(asin):
         window = units_list[start_idx:end_idx]
         units_smooth = sum(window) / len(window) if window else 0
         
+        # Safely format week_end
+        week_end = sale['week_end']
+        if hasattr(week_end, 'isoformat'):
+            week_end_str = week_end.isoformat()
+        else:
+            week_end_str = str(week_end)
+        
         historical.append({
-            'week_end': sale['week_end'].isoformat(),
+            'week_end': week_end_str,
             'units_sold': sale['units'],
             'units_smooth': round(units_smooth, 1)
         })
@@ -810,17 +817,28 @@ def get_forecast_chart(asin):
     
     # Extend to 104 weeks if needed
     last_date = units_data[-1]['week_end'] if units_data else today
-    if algorithm_forecasts:
-        last_forecast_date = datetime.fromisoformat(algorithm_forecasts[-1]['week_end']).date() if algorithm_forecasts else last_date
-    else:
-        last_forecast_date = last_date
+    
+    # Safely get last forecast date
+    last_forecast_date = last_date
+    if algorithm_forecasts and len(algorithm_forecasts) > 0:
+        last_week_end = algorithm_forecasts[-1].get('week_end')
+        if last_week_end:
+            if isinstance(last_week_end, str):
+                try:
+                    last_forecast_date = date.fromisoformat(last_week_end)
+                except:
+                    last_forecast_date = last_date
+            elif hasattr(last_week_end, 'isoformat'):
+                last_forecast_date = last_week_end
     
     # Fill remaining weeks up to 104 total
     market_adj = settings.get('market_adjustment', 0.05)
     base_forecast = weekly_forecast_avg * (1 + market_adj)
     
+    existing_forecast_count = len(forecast_weeks)
     while len(forecast_weeks) < 104:
-        next_date = last_forecast_date + timedelta(weeks=len(forecast_weeks) - len(algorithm_forecasts) + 1) if algorithm_forecasts else last_date + timedelta(weeks=len(forecast_weeks) + 1)
+        weeks_to_add = len(forecast_weeks) - existing_forecast_count + 1
+        next_date = last_forecast_date + timedelta(weeks=weeks_to_add)
         forecast_weeks.append({
             'week_end': next_date.isoformat(),
             'units_smooth': round(base_forecast, 1),
