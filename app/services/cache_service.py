@@ -122,6 +122,7 @@ class CacheService:
                 first_sale = first_sales.get(asin)
                 
                 if not first_sale:
+                    # No sales - skip but don't count as error
                     continue
                 
                 age_days = (today - first_sale).days
@@ -140,6 +141,7 @@ class CacheService:
                 units_data = [{'week_end': s.week_date, 'units': s.units} for s in sales]
                 
                 if len(units_data) < 4:
+                    # Not enough data - skip
                     continue
                 
                 # Get inventory
@@ -150,26 +152,50 @@ class CacheService:
                 settings['total_inventory'] = inventory.total_inventory
                 settings['fba_available'] = inventory.fba_available
                 
-                # Run appropriate algorithm (with fallback to 18m+ if others fail)
+                result = None
+                
+                # Always try 18m+ first (most reliable)
                 try:
-                    if algorithm == "18m+":
-                        result = tps_18m(units_data, today, settings)
-                    elif algorithm == "6-18m":
-                        if seasonality_data:
-                            result = tps_6_18m(units_data, today, settings, seasonality_data)
-                        else:
-                            result = tps_18m(units_data, today, settings)
-                            algorithm = "18m+ (fallback)"
-                    else:  # 0-6m
-                        if seasonality_data:
-                            result = tps_0_6m(units_data, today, settings, seasonality_data)
-                        else:
-                            result = tps_18m(units_data, today, settings)
-                            algorithm = "18m+ (fallback)"
-                except Exception as algo_error:
-                    # Fallback to 18m+ if specific algorithm fails
                     result = tps_18m(units_data, today, settings)
-                    algorithm = "18m+ (fallback)"
+                    if algorithm != "18m+":
+                        algorithm = f"{algorithm}→18m+"
+                except Exception as e18:
+                    pass
+                
+                # If 18m+ failed, try simple fallback calculation
+                if result is None:
+                    try:
+                        # Simple fallback: average weekly sales * lead time weeks
+                        avg_weekly = sum(d['units'] for d in units_data[-12:]) / min(12, len(units_data))
+                        lead_time_weeks = (settings.get('inbound_lead_time', 30) + settings.get('manufacture_lead_time', 7)) / 7
+                        doi_goal_weeks = settings.get('amazon_doi_goal', 93) / 7
+                        
+                        total_weeks_needed = lead_time_weeks + doi_goal_weeks
+                        units_needed = avg_weekly * total_weeks_needed
+                        units_to_make = max(0, int(units_needed - inventory.total_inventory))
+                        
+                        # Calculate DOI
+                        doi_total = (inventory.total_inventory / avg_weekly * 7) if avg_weekly > 0 else 0
+                        doi_fba = (inventory.fba_available / avg_weekly * 7) if avg_weekly > 0 else 0
+                        
+                        result = {
+                            'units_to_make': units_to_make,
+                            'doi_total_days': doi_total,
+                            'doi_fba_days': doi_fba,
+                            'total_units_needed': units_needed,
+                            'sales_velocity_adjustment': 0
+                        }
+                        algorithm = "simple"
+                    except:
+                        # Last resort: just set everything to 0
+                        result = {
+                            'units_to_make': 0,
+                            'doi_total_days': 0,
+                            'doi_fba_days': 0,
+                            'total_units_needed': 0,
+                            'sales_velocity_adjustment': 0
+                        }
+                        algorithm = "fallback"
                 
                 # Prepare cache entry
                 cache_entry = {
@@ -189,8 +215,8 @@ class CacheService:
                 
             except Exception as e:
                 error_count += 1
-                if error_count <= 5:
-                    print(f"[CACHE] Error for {asin}: {str(e)[:50]}")
+                if error_count <= 10:
+                    print(f"[CACHE] Error for {asin}: {str(e)[:80]}")
             
             # Progress update
             if (i + 1) % 100 == 0:
