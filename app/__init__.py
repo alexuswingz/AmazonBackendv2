@@ -5,9 +5,11 @@ Initializes the Flask app with:
 - SQLAlchemy database
 - SQLite performance optimizations
 - API blueprints
+- CORS support for frontend
 """
 from flask import Flask
 from flask_sqlalchemy import SQLAlchemy
+from flask_cors import CORS
 from config import config
 
 db = SQLAlchemy()
@@ -17,6 +19,15 @@ def create_app(config_name='default'):
     """Application factory pattern."""
     app = Flask(__name__)
     app.config.from_object(config[config_name])
+    
+    # Enable CORS for frontend development
+    CORS(app, resources={
+        r"/api/*": {
+            "origins": ["http://localhost:3000", "http://127.0.0.1:3000"],
+            "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization"]
+        }
+    })
     
     # Initialize database
     db.init_app(app)

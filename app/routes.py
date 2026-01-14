@@ -1,7 +1,7 @@
 """API routes for product forecasting application."""
 from flask import Blueprint, jsonify, request
 from app import db
-from app.models import FBAInventory, AWDInventory, Product, UnitsSold
+from app.models import FBAInventory, AWDInventory, Product, UnitsSold, LabelInventory
 from sqlalchemy import func
 
 api_bp = Blueprint('api', __name__)
@@ -189,6 +189,10 @@ def get_all_forecasts():
         - brand: Filter by brand name (optional)
         - sort: Sort field - 'doi' (default), 'units', 'product', 'fba'
         - order: 'asc' (default) or 'desc'
+        - amazon_doi_goal: DOI goal in days (default: 93)
+        - inbound_lead_time: Inbound lead time in days (default: 30)
+        - manufacture_lead_time: Manufacturing lead time in days (default: 7)
+        - market_adjustment: Market adjustment percentage (default: 0.05)
     """
     from app.algorithms.algorithms_tps import (
         calculate_forecast_18m_plus as tps_18m,
@@ -200,9 +204,26 @@ def get_all_forecasts():
     
     start_time = time.time()
     
+    # Query params
     brand_filter = request.args.get('brand', None)
     sort_by = request.args.get('sort', 'doi')
     order = request.args.get('order', 'asc')
+    
+    # DOI Settings - allow custom values from frontend
+    amazon_doi_goal = request.args.get('amazon_doi_goal', type=int, default=93)
+    inbound_lead_time = request.args.get('inbound_lead_time', type=int, default=30)
+    manufacture_lead_time = request.args.get('manufacture_lead_time', type=int, default=7)
+    market_adjustment = request.args.get('market_adjustment', type=float, default=0.05)
+    
+    # Build custom settings
+    custom_settings = DEFAULT_SETTINGS.copy()
+    custom_settings['amazon_doi_goal'] = amazon_doi_goal
+    custom_settings['inbound_lead_time'] = inbound_lead_time
+    custom_settings['manufacture_lead_time'] = manufacture_lead_time
+    custom_settings['market_adjustment'] = market_adjustment
+    
+    # Calculate total required DOI
+    total_required_doi = amazon_doi_goal + inbound_lead_time + manufacture_lead_time
     
     today = date.today()
     
@@ -285,8 +306,8 @@ def get_all_forecasts():
             total_inv = int(fba_totals.get(asin, 0) or 0) + int(awd_totals.get(asin, 0) or 0)
             fba_avail = int(fba_available.get(asin, 0) or 0)
             
-            # Settings
-            settings = DEFAULT_SETTINGS.copy()
+            # Settings - use custom settings from request params
+            settings = custom_settings.copy()
             settings['total_inventory'] = total_inv
             settings['fba_available'] = fba_avail
             
@@ -301,12 +322,18 @@ def get_all_forecasts():
             return {
                 'brand': product.brand or 'TPS Plant Foods',
                 'product': product.product_name,
+                'product_name': product.product_name,  # Alias for frontend compatibility
                 'size': product.size,
                 'asin': asin,
                 'units_to_make': result['units_to_make'],
                 'doi_total_days': round(result['doi_total_days'], 0),
                 'doi_fba_days': round(result['doi_fba_days'], 0),
-                'algorithm': algorithm
+                'doi_total': round(result['doi_total_days'], 0),  # Alias
+                'doi_fba': round(result['doi_fba_days'], 0),  # Alias
+                'total_inventory': total_inv,
+                'fba_available': fba_avail,
+                'algorithm': algorithm,
+                'age_months': round(age_months, 1)
             }
         except:
             return None
@@ -336,9 +363,19 @@ def get_all_forecasts():
     total_time = time.time() - start_time
     
     return jsonify({
-        'forecasts': forecasts,
+        'success': True,
+        'products': forecasts,  # Frontend expects 'products' not 'forecasts'
+        'forecasts': forecasts,  # Keep for backwards compatibility
+        'count': len(forecasts),
         'total': len(forecasts),
         'sort': {'field': sort_by, 'order': order},
+        'settings': {
+            'amazon_doi_goal': amazon_doi_goal,
+            'inbound_lead_time': inbound_lead_time,
+            'manufacture_lead_time': manufacture_lead_time,
+            'total_required_doi': total_required_doi,
+            'market_adjustment': market_adjustment
+        },
         'performance': {
             'data_load_seconds': round(load_time, 2),
             'calculation_seconds': round(calc_time, 2),
@@ -375,6 +412,11 @@ def refresh_forecast_cache():
 def get_forecast_data(asin):
     """
     Get complete forecast for a product - matching Excel Settings page output.
+    
+    Query params (optional):
+        - amazon_doi_goal: Days of inventory goal (default: 93)
+        - inbound_lead_time: Shipping time in days (default: 30)
+        - manufacture_lead_time: Production time in days (default: 7)
     
     Returns:
         - Product Info (ASIN, Product, Size)
@@ -428,10 +470,30 @@ def get_forecast_data(asin):
     total_inventory = inventory.total_inventory
     fba_available = inventory.fba_available
     
+    # Get custom DOI settings from query parameters (or use defaults)
+    custom_amazon_doi_goal = request.args.get('amazon_doi_goal', type=int)
+    custom_inbound_lead_time = request.args.get('inbound_lead_time', type=int)
+    custom_manufacture_lead_time = request.args.get('manufacture_lead_time', type=int)
+    
     # Settings
     settings = DEFAULT_SETTINGS.copy()
     settings['total_inventory'] = total_inventory
     settings['fba_available'] = fba_available
+    
+    # Apply custom DOI settings if provided
+    if custom_amazon_doi_goal is not None:
+        settings['amazon_doi_goal'] = custom_amazon_doi_goal
+    if custom_inbound_lead_time is not None:
+        settings['inbound_lead_time'] = custom_inbound_lead_time
+    if custom_manufacture_lead_time is not None:
+        settings['manufacture_lead_time'] = custom_manufacture_lead_time
+    
+    # Recalculate total_required_doi based on custom settings
+    settings['total_required_doi'] = (
+        settings['amazon_doi_goal'] +
+        settings['inbound_lead_time'] +
+        settings['manufacture_lead_time']
+    )
     
     # Run the appropriate algorithm
     if algorithm == "18m+":
@@ -606,6 +668,220 @@ def batch_forecast():
     })
 
 
+@api_bp.route('/forecast/<asin>/chart', methods=['GET'])
+def get_forecast_chart(asin):
+    """
+    Get complete forecast data for chart visualization.
+    
+    Returns:
+        - Product info (name, size, ASIN, brand)
+        - FBA inventory breakdown (total, available, reserved, inbound)
+        - AWD inventory breakdown (total, outbound, available, reserved)
+        - Label inventory
+        - DOI metrics (FBA days, Total days, goal date)
+        - Units to Make
+        - Historical data with smoothed values
+        - Forecast data with adjusted values
+    """
+    from app.algorithms.algorithms_tps import (
+        calculate_forecast_18m_plus as tps_18m,
+        DEFAULT_SETTINGS
+    )
+    from datetime import date, timedelta, datetime
+    
+    today = date.today()
+    
+    # Get product info
+    product = Product.query.filter_by(asin=asin).first()
+    if not product:
+        return jsonify({'error': f'Product not found: {asin}'}), 404
+    
+    # Get product age
+    first_sale = db.session.query(func.min(UnitsSold.week_date)).filter(
+        UnitsSold.asin == asin, UnitsSold.units > 0
+    ).scalar()
+    
+    if not first_sale:
+        return jsonify({'error': 'No sales history for product'}), 404
+    
+    age_days = (today - first_sale).days
+    age_months = age_days / 30.44
+    
+    # Determine algorithm
+    if age_months >= 18:
+        algorithm = "18m+"
+    elif age_months >= 6:
+        algorithm = "6-18m"
+    else:
+        algorithm = "0-6m"
+    
+    # Get sales data
+    sales = UnitsSold.query.filter_by(asin=asin).order_by(UnitsSold.week_date).all()
+    units_data = [{'week_end': s.week_date, 'units': s.units} for s in sales]
+    
+    # Get FBA inventory (detailed)
+    fba_records = FBAInventory.query.filter_by(asin=asin).all()
+    fba_total = sum(f.available or 0 for f in fba_records) + \
+                sum(f.inbound_quantity or 0 for f in fba_records) + \
+                sum(f.total_reserved_quantity or 0 for f in fba_records)
+    fba_available = sum(f.available or 0 for f in fba_records)
+    fba_reserved = sum(f.total_reserved_quantity or 0 for f in fba_records)
+    fba_inbound = sum(f.inbound_quantity or 0 for f in fba_records)
+    
+    # Get AWD inventory (detailed)
+    awd_records = AWDInventory.query.filter_by(asin=asin).all()
+    awd_total = sum(a.available_in_awd_units or 0 for a in awd_records) + \
+                sum(a.inbound_to_awd_units or 0 for a in awd_records) + \
+                sum(a.reserved_in_awd_units or 0 for a in awd_records) + \
+                sum(a.outbound_to_fba_units or 0 for a in awd_records)
+    awd_available = sum(a.available_in_awd_units or 0 for a in awd_records)
+    awd_outbound = sum(a.outbound_to_fba_units or 0 for a in awd_records)
+    awd_reserved = sum(a.reserved_in_awd_units or 0 for a in awd_records)
+    
+    # Get label inventory
+    label = LabelInventory.query.filter_by(asin=asin).first()
+    label_inventory = label.label_inventory if label else 0
+    label_id = label.label_id if label else None
+    label_status = label.label_status if label else None
+    
+    # Calculate total inventory
+    total_inventory = fba_total + awd_total
+    
+    # Settings
+    settings = DEFAULT_SETTINGS.copy()
+    settings['total_inventory'] = total_inventory
+    settings['fba_available'] = fba_available
+    
+    # Run the TPS algorithm with full details
+    result = tps_18m(units_data, today, settings)
+    
+    units_to_make = result['units_to_make']
+    doi_total = result.get('doi_total_days', 0)
+    doi_fba = result.get('doi_fba_days', 0)
+    velocity_adj = result.get('sales_velocity_adjustment', 0)
+    
+    # Calculate DOI goal date
+    doi_goal = settings.get('amazon_doi_goal', 93) + settings.get('inbound_lead_time', 30) + settings.get('manufacture_lead_time', 7)
+    doi_goal_date = today + timedelta(days=doi_goal)
+    
+    # Build historical data with smoothing
+    historical = []
+    units_list = [s['units'] for s in units_data]
+    
+    for i, sale in enumerate(units_data):
+        # Calculate 5-week moving average for smoothing (similar to chart)
+        start_idx = max(0, i - 2)
+        end_idx = min(len(units_list), i + 3)
+        window = units_list[start_idx:end_idx]
+        units_smooth = sum(window) / len(window) if window else 0
+        
+        historical.append({
+            'week_end': sale['week_end'].isoformat(),
+            'units_sold': sale['units'],
+            'units_smooth': round(units_smooth, 1)
+        })
+    
+    # Build forecast data (future weeks) using algorithm's actual forecast values
+    forecast_weeks = []
+    
+    # Get the weekly forecasts from the algorithm result (includes seasonality)
+    algorithm_forecasts = result.get('forecasts', [])
+    
+    # Get weekly average from the algorithm result for fallback
+    weekly_forecast_avg = 0
+    if algorithm_forecasts:
+        forecast_values = [f.get('forecast', 0) for f in algorithm_forecasts if f.get('forecast', 0) > 0]
+        weekly_forecast_avg = sum(forecast_values) / len(forecast_values) if forecast_values else 0
+    elif len(units_list) > 0:
+        # Calculate from recent data if not available
+        recent_weeks = units_list[-13:] if len(units_list) >= 13 else units_list
+        weekly_forecast_avg = sum(recent_weeks) / len(recent_weeks) if recent_weeks else 0
+    
+    # Use algorithm's forecasts (has seasonality-adjusted values)
+    if algorithm_forecasts:
+        for forecast_item in algorithm_forecasts:
+            week_end = forecast_item.get('week_end')
+            forecast_val = forecast_item.get('forecast', 0)
+            forecast_weeks.append({
+                'week_end': week_end,
+                'units_smooth': round(forecast_val, 1),
+                'adj_forecast': round(forecast_val, 1)
+            })
+    
+    # Extend to 104 weeks if needed
+    last_date = units_data[-1]['week_end'] if units_data else today
+    if algorithm_forecasts:
+        last_forecast_date = datetime.fromisoformat(algorithm_forecasts[-1]['week_end']).date() if algorithm_forecasts else last_date
+    else:
+        last_forecast_date = last_date
+    
+    # Fill remaining weeks up to 104 total
+    market_adj = settings.get('market_adjustment', 0.05)
+    base_forecast = weekly_forecast_avg * (1 + market_adj)
+    
+    while len(forecast_weeks) < 104:
+        next_date = last_forecast_date + timedelta(weeks=len(forecast_weeks) - len(algorithm_forecasts) + 1) if algorithm_forecasts else last_date + timedelta(weeks=len(forecast_weeks) + 1)
+        forecast_weeks.append({
+            'week_end': next_date.isoformat(),
+            'units_smooth': round(base_forecast, 1),
+            'adj_forecast': round(base_forecast, 1)
+        })
+    
+    # Calculate labels needed
+    labels_needed = max(0, units_to_make - label_inventory)
+    labels_have_enough = label_inventory >= units_to_make
+    
+    return jsonify({
+        'success': True,
+        'asin': asin,
+        'algorithm': algorithm,
+        'product': {
+            'name': product.product_name,
+            'size': product.size,
+            'brand': product.brand or 'TPS Plant Foods'
+        },
+        'inventory': {
+            'fba': {
+                'total': fba_total,
+                'available': fba_available,
+                'reserved': fba_reserved,
+                'inbound': fba_inbound
+            },
+            'awd': {
+                'total': awd_total,
+                'outbound': awd_outbound,
+                'available': awd_available,
+                'reserved': awd_reserved
+            }
+        },
+        'labels': {
+            'inventory': label_inventory,
+            'needed': labels_needed,
+            'have_enough': labels_have_enough,
+            'label_id': label_id,
+            'status': label_status
+        },
+        'add_units': units_to_make,  # Units to add to production
+        'doi': {
+            'fba_days': round(doi_fba, 0),
+            'total_days': round(doi_total, 0),
+            'goal_days': doi_goal,
+            'goal_date': doi_goal_date.isoformat()
+        },
+        'units_to_make': units_to_make,
+        'historical': historical,
+        'forecast': forecast_weeks,
+        'metadata': {
+            'today': today.isoformat(),
+            'weeks_historical': len(historical),
+            'weeks_forecast': len(forecast_weeks),
+            'weekly_avg_forecast': round(weekly_forecast_avg, 1),
+            'velocity_adjustment': round(velocity_adj, 4),
+            'market_adjustment': market_adj
+        }
+    })
+
+
 @api_bp.route('/forecast/<asin>/tps', methods=['GET', 'POST'])
 def calculate_forecast_tps(asin):
     """
@@ -648,3 +924,450 @@ def calculate_forecast_tps(asin):
     result = forecast_service.run_forecast_tps(asin, custom_settings if custom_settings else None)
     
     return jsonify(result)
+
+
+# =====================================================
+# LABEL INVENTORY ROUTES
+# =====================================================
+
+@api_bp.route('/labels', methods=['GET'])
+def get_label_inventory():
+    """
+    Get label inventory for all products.
+    
+    Query params:
+        - sort: Sort field - 'inventory' (default), 'product', 'needed'
+        - order: 'asc' (default) or 'desc'
+    """
+    sort_by = request.args.get('sort', 'inventory')
+    order = request.args.get('order', 'asc')
+    
+    labels = LabelInventory.query.all()
+    
+    results = [{
+        'asin': l.asin,
+        'product_name': l.product_name,
+        'size': l.size,
+        'label_id': l.label_id,
+        'label_status': l.label_status,
+        'label_inventory': l.label_inventory
+    } for l in labels]
+    
+    # Sort
+    sort_key = {
+        'inventory': 'label_inventory',
+        'product': 'product_name'
+    }.get(sort_by, 'label_inventory')
+    
+    reverse = (order == 'desc')
+    results.sort(key=lambda x: (x.get(sort_key) or 0) if sort_key != 'product_name' else (x.get(sort_key) or ''), reverse=reverse)
+    
+    return jsonify({
+        'labels': results,
+        'total': len(results),
+        'total_labels_in_stock': sum(l.label_inventory for l in labels)
+    })
+
+
+@api_bp.route('/labels/needed', methods=['GET'])
+def get_labels_needed():
+    """
+    Get labels needed based on forecast - combines forecast with label inventory.
+    
+    For each product:
+    - labels_needed = units_to_make - label_inventory
+    - If negative, means we have enough labels
+    
+    Query params:
+        - sort: Sort field - 'needed' (default), 'product', 'inventory'
+        - order: 'desc' (default) or 'asc'
+    """
+    from app.services.forecast_service import forecast_service
+    from app.algorithms.algorithms_tps import (
+        calculate_forecast_18m_plus as tps_18m,
+        DEFAULT_SETTINGS
+    )
+    from datetime import date
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import time
+    
+    start_time = time.time()
+    
+    sort_by = request.args.get('sort', 'needed')
+    order = request.args.get('order', 'desc')
+    
+    today = date.today()
+    
+    # Get all label inventory
+    labels = {l.asin: l for l in LabelInventory.query.all()}
+    
+    # Get all products that have labels
+    products = {p.asin: p for p in Product.query.filter(Product.asin.in_(labels.keys())).all()}
+    
+    # Bulk load forecast data (same as /forecast/all)
+    first_sales = dict(
+        db.session.query(
+            UnitsSold.asin,
+            func.min(UnitsSold.week_date)
+        ).filter(UnitsSold.units > 0).group_by(UnitsSold.asin).all()
+    )
+    
+    all_sales = db.session.query(
+        UnitsSold.asin, UnitsSold.week_date, UnitsSold.units
+    ).order_by(UnitsSold.asin, UnitsSold.week_date).all()
+    
+    sales_by_asin = {}
+    for sale in all_sales:
+        if sale.asin not in sales_by_asin:
+            sales_by_asin[sale.asin] = []
+        sales_by_asin[sale.asin].append({'week_end': sale.week_date, 'units': sale.units})
+    
+    # Inventory totals
+    fba_totals = dict(
+        db.session.query(
+            FBAInventory.asin,
+            func.coalesce(func.sum(FBAInventory.available), 0) + 
+            func.coalesce(func.sum(FBAInventory.inbound_quantity), 0) +
+            func.coalesce(func.sum(FBAInventory.total_reserved_quantity), 0)
+        ).group_by(FBAInventory.asin).all()
+    )
+    
+    fba_available = dict(
+        db.session.query(
+            FBAInventory.asin,
+            func.coalesce(func.sum(FBAInventory.available), 0)
+        ).group_by(FBAInventory.asin).all()
+    )
+    
+    awd_totals = dict(
+        db.session.query(
+            AWDInventory.asin,
+            func.coalesce(func.sum(AWDInventory.available_in_awd_units), 0) +
+            func.coalesce(func.sum(AWDInventory.inbound_to_awd_units), 0) +
+            func.coalesce(func.sum(AWDInventory.reserved_in_awd_units), 0) +
+            func.coalesce(func.sum(AWDInventory.outbound_to_fba_units), 0)
+        ).group_by(AWDInventory.asin).all()
+    )
+    
+    def calculate_single(asin):
+        try:
+            label = labels.get(asin)
+            product = products.get(asin)
+            
+            if not label or not product:
+                return None
+            
+            first_sale = first_sales.get(asin)
+            if not first_sale:
+                return {
+                    'asin': asin,
+                    'product_name': label.product_name,
+                    'size': label.size,
+                    'label_id': label.label_id,
+                    'label_inventory': label.label_inventory,
+                    'units_to_make': 0,
+                    'labels_needed': 0,
+                    'status': 'No forecast data'
+                }
+            
+            units_data = sales_by_asin.get(asin, [])
+            if len(units_data) < 4:
+                return {
+                    'asin': asin,
+                    'product_name': label.product_name,
+                    'size': label.size,
+                    'label_id': label.label_id,
+                    'label_inventory': label.label_inventory,
+                    'units_to_make': 0,
+                    'labels_needed': 0,
+                    'status': 'Insufficient sales data'
+                }
+            
+            # Get inventory
+            total_inv = int(fba_totals.get(asin, 0) or 0) + int(awd_totals.get(asin, 0) or 0)
+            fba_avail = int(fba_available.get(asin, 0) or 0)
+            
+            # Run forecast
+            settings = DEFAULT_SETTINGS.copy()
+            settings['total_inventory'] = total_inv
+            settings['fba_available'] = fba_avail
+            
+            result = tps_18m(units_data, today, settings)
+            units_to_make = result['units_to_make']
+            
+            # Calculate labels needed
+            labels_needed = max(0, units_to_make - label.label_inventory)
+            
+            return {
+                'asin': asin,
+                'product_name': label.product_name,
+                'size': label.size,
+                'label_id': label.label_id,
+                'label_inventory': label.label_inventory,
+                'units_to_make': units_to_make,
+                'labels_needed': labels_needed,
+                'status': 'Need labels' if labels_needed > 0 else 'Have enough'
+            }
+        except:
+            return None
+    
+    # Parallel calculation
+    results = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(calculate_single, asin): asin for asin in labels.keys()}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                results.append(result)
+    
+    # Sort
+    sort_key = {
+        'needed': 'labels_needed',
+        'inventory': 'label_inventory',
+        'product': 'product_name',
+        'units': 'units_to_make'
+    }.get(sort_by, 'labels_needed')
+    
+    reverse = (order == 'desc')
+    results.sort(key=lambda x: (x.get(sort_key) or 0) if sort_key != 'product_name' else (x.get(sort_key) or ''), reverse=reverse)
+    
+    total_time = time.time() - start_time
+    
+    # Summary stats
+    total_labels_needed = sum(r['labels_needed'] for r in results)
+    products_needing_labels = len([r for r in results if r['labels_needed'] > 0])
+    
+    return jsonify({
+        'labels': results,
+        'total_products': len(results),
+        'summary': {
+            'total_labels_needed': total_labels_needed,
+            'products_needing_labels': products_needing_labels,
+            'products_with_enough': len(results) - products_needing_labels
+        },
+        'performance': {
+            'total_seconds': round(total_time, 2)
+        }
+    })
+
+
+@api_bp.route('/labels/schedule', methods=['GET'])
+def get_labels_schedule():
+    """
+    Get label production schedule - grouped by label_id with DOI-based timing.
+    
+    This shows:
+    - Labels grouped by label_id (one label design may be used for multiple products)
+    - When labels are needed based on DOI (days of inventory)
+    - Aggregated quantities per label design
+    
+    Response format:
+    LABEL STATUS | BRAND | PRODUCT | SIZE | ADD | QTY | DOI | NEEDED BY
+    """
+    from app.algorithms.algorithms_tps import (
+        calculate_forecast_18m_plus as tps_18m,
+        DEFAULT_SETTINGS
+    )
+    from datetime import date, timedelta
+    from collections import defaultdict
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import time
+    
+    start_time = time.time()
+    today = date.today()
+    
+    # Get all label inventory
+    labels_list = LabelInventory.query.all()
+    labels = {l.asin: l for l in labels_list}
+    
+    # Get all products that have labels
+    products = {p.asin: p for p in Product.query.filter(Product.asin.in_(labels.keys())).all()}
+    
+    # Bulk load data
+    first_sales = dict(
+        db.session.query(
+            UnitsSold.asin,
+            func.min(UnitsSold.week_date)
+        ).filter(UnitsSold.units > 0).group_by(UnitsSold.asin).all()
+    )
+    
+    all_sales = db.session.query(
+        UnitsSold.asin, UnitsSold.week_date, UnitsSold.units
+    ).order_by(UnitsSold.asin, UnitsSold.week_date).all()
+    
+    sales_by_asin = {}
+    for sale in all_sales:
+        if sale.asin not in sales_by_asin:
+            sales_by_asin[sale.asin] = []
+        sales_by_asin[sale.asin].append({'week_end': sale.week_date, 'units': sale.units})
+    
+    fba_totals = dict(
+        db.session.query(
+            FBAInventory.asin,
+            func.coalesce(func.sum(FBAInventory.available), 0) + 
+            func.coalesce(func.sum(FBAInventory.inbound_quantity), 0) +
+            func.coalesce(func.sum(FBAInventory.total_reserved_quantity), 0)
+        ).group_by(FBAInventory.asin).all()
+    )
+    
+    fba_available = dict(
+        db.session.query(
+            FBAInventory.asin,
+            func.coalesce(func.sum(FBAInventory.available), 0)
+        ).group_by(FBAInventory.asin).all()
+    )
+    
+    awd_totals = dict(
+        db.session.query(
+            AWDInventory.asin,
+            func.coalesce(func.sum(AWDInventory.available_in_awd_units), 0) +
+            func.coalesce(func.sum(AWDInventory.inbound_to_awd_units), 0) +
+            func.coalesce(func.sum(AWDInventory.reserved_in_awd_units), 0) +
+            func.coalesce(func.sum(AWDInventory.outbound_to_fba_units), 0)
+        ).group_by(AWDInventory.asin).all()
+    )
+    
+    def calculate_single_with_doi(asin):
+        """Calculate forecast with DOI for timing."""
+        try:
+            label = labels.get(asin)
+            product = products.get(asin)
+            
+            if not label or not product:
+                return None
+            
+            first_sale = first_sales.get(asin)
+            units_data = sales_by_asin.get(asin, [])
+            
+            units_to_make = 0
+            doi_total = 0
+            doi_fba = 0
+            
+            if first_sale and len(units_data) >= 4:
+                total_inv = int(fba_totals.get(asin, 0) or 0) + int(awd_totals.get(asin, 0) or 0)
+                fba_avail = int(fba_available.get(asin, 0) or 0)
+                
+                settings = DEFAULT_SETTINGS.copy()
+                settings['total_inventory'] = total_inv
+                settings['fba_available'] = fba_avail
+                
+                result = tps_18m(units_data, today, settings)
+                units_to_make = result['units_to_make']
+                doi_total = result.get('doi_total_days', 0)
+                doi_fba = result.get('doi_fba_days', 0)
+            
+            # Calculate when labels are needed based on DOI
+            # Labels needed by = today + DOI - lead_time (37 days default)
+            lead_time = 37  # manufacture + inbound lead time
+            stockout_date = today + timedelta(days=int(doi_total)) if doi_total > 0 else today
+            labels_needed_by = stockout_date - timedelta(days=lead_time)
+            if labels_needed_by < today:
+                labels_needed_by = today  # Already overdue
+            
+            return {
+                'asin': asin,
+                'label_id': label.label_id,
+                'label_status': label.label_status,
+                'brand': product.brand or 'TPS Plant Foods',
+                'product_name': label.product_name,
+                'size': label.size,
+                'label_inventory': label.label_inventory,
+                'units_to_make': units_to_make,
+                'doi_total': round(doi_total, 0),
+                'doi_fba': round(doi_fba, 0),
+                'stockout_date': stockout_date.isoformat(),
+                'labels_needed_by': labels_needed_by.isoformat()
+            }
+        except Exception as e:
+            return None
+    
+    # Parallel calculation
+    product_results = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(calculate_single_with_doi, asin): asin for asin in labels.keys()}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                product_results.append(result)
+    
+    # Group by label_id and aggregate
+    label_groups = defaultdict(lambda: {
+        'label_id': '',
+        'label_status': '',
+        'brands': set(),
+        'products': [],
+        'sizes': set(),
+        'total_label_inventory': 0,
+        'total_units_to_make': 0,
+        'min_doi': float('inf'),
+        'earliest_needed_by': None
+    })
+    
+    for pr in product_results:
+        lid = pr['label_id']
+        group = label_groups[lid]
+        
+        group['label_id'] = lid
+        group['label_status'] = pr['label_status']
+        group['brands'].add(pr['brand'])
+        group['products'].append({
+            'asin': pr['asin'],
+            'name': pr['product_name'],
+            'size': pr['size'],
+            'units_to_make': pr['units_to_make'],
+            'doi': pr['doi_total'],
+            'needed_by': pr['labels_needed_by']
+        })
+        group['sizes'].add(pr['size'])
+        group['total_label_inventory'] += pr['label_inventory']
+        group['total_units_to_make'] += pr['units_to_make']
+        
+        # Track minimum DOI (most urgent)
+        if pr['doi_total'] < group['min_doi']:
+            group['min_doi'] = pr['doi_total']
+        
+        # Track earliest needed_by date
+        needed_by = date.fromisoformat(pr['labels_needed_by'])
+        if group['earliest_needed_by'] is None or needed_by < group['earliest_needed_by']:
+            group['earliest_needed_by'] = needed_by
+    
+    # Convert to list
+    results = []
+    for lid, group in label_groups.items():
+        labels_needed = max(0, group['total_units_to_make'] - group['total_label_inventory'])
+        min_doi = group['min_doi'] if group['min_doi'] != float('inf') else 0
+        
+        results.append({
+            'label_id': lid,
+            'label_status': group['label_status'],
+            'brand': ', '.join(sorted(group['brands'])) if group['brands'] else 'TPS Plant Foods',
+            'products': group['products'],
+            'product_names': ', '.join([p['name'] for p in group['products'][:3]]) + ('...' if len(group['products']) > 3 else ''),
+            'sizes': ', '.join(sorted(group['sizes'])),
+            'add': 0,  # Placeholder for UI "ADD" column
+            'qty': group['total_units_to_make'],
+            'label_inventory': group['total_label_inventory'],
+            'labels_needed': labels_needed,
+            'doi': int(min_doi),
+            'needed_by': group['earliest_needed_by'].isoformat() if group['earliest_needed_by'] else None
+        })
+    
+    # Sort by DOI ascending (most urgent first - lowest DOI)
+    results.sort(key=lambda x: (x['doi'], -x['labels_needed']))
+    
+    total_time = time.time() - start_time
+    
+    return jsonify({
+        'labels': results,
+        'total_label_designs': len(results),
+        'total_products': len(product_results),
+        'summary': {
+            'total_labels_needed': sum(r['labels_needed'] for r in results),
+            'labels_needing_production': len([r for r in results if r['labels_needed'] > 0]),
+            'total_label_inventory': sum(r['label_inventory'] for r in results),
+            'urgent_count': len([r for r in results if r['doi'] < 30 and r['labels_needed'] > 0])
+        },
+        'performance': {
+            'total_seconds': round(total_time, 2)
+        }
+    })

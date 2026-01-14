@@ -254,3 +254,25 @@ class ForecastCache(db.Model):
     
     def __repr__(self):
         return f'<ForecastCache {self.asin} ({self.algorithm})>'
+
+
+class LabelInventory(db.Model):
+    """
+    Label inventory for each product.
+    
+    Tracks how many labels are in stock for each ASIN.
+    Used to calculate labels needed based on production forecast.
+    """
+    __tablename__ = 'label_inventory'
+    
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    asin = db.Column(db.String(50), unique=True, nullable=False)
+    product_name = db.Column(db.Text)
+    size = db.Column(db.String(50))
+    label_id = db.Column(db.String(50))  # e.g., LBL-PLANT-494
+    label_status = db.Column(db.String(50))  # e.g., "Up to Date"
+    label_inventory = db.Column(db.Integer, default=0)  # Labels in stock
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    def __repr__(self):
+        return f'<LabelInventory {self.asin}: {self.label_inventory} labels>'
