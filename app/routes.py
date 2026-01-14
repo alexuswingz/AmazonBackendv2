@@ -173,6 +173,77 @@ def get_awd_by_asin(asin):
     })
 
 
+# =====================================================
+# STATIC FORECAST ROUTES (must be defined BEFORE dynamic routes)
+# =====================================================
+
+@api_bp.route('/forecast/all', methods=['GET'])
+def get_all_forecasts():
+    """
+    Get forecast summary for ALL products - FAST (reads from cache).
+    
+    Returns: Brand, Product, Size, Units to Make for ALL products (no pagination).
+    Sorted by DOI Total (ascending) - lowest inventory days first.
+    
+    Query params:
+        - brand: Filter by brand name (optional)
+        - sort: Sort field - 'doi' (default), 'units', 'product', 'fba'
+        - order: 'asc' (default) or 'desc'
+    """
+    from app.services.cache_service import cache_service
+    
+    brand_filter = request.args.get('brand', None)
+    sort_by = request.args.get('sort', 'doi')
+    order = request.args.get('order', 'asc')
+    
+    # Read from cache - INSTANT for 1000+ products
+    forecasts = cache_service.get_all_cached_forecasts(brand_filter)
+    
+    # Sort by DOI (or other field)
+    sort_key = {
+        'doi': 'doi_total_days',
+        'fba': 'doi_fba_days',
+        'units': 'units_to_make',
+        'product': 'product'
+    }.get(sort_by, 'doi_total_days')
+    
+    reverse = (order == 'desc')
+    forecasts.sort(key=lambda x: (x.get(sort_key) or 0) if sort_key != 'product' else (x.get(sort_key) or ''), reverse=reverse)
+    
+    cache_stats = cache_service.get_cache_stats()
+    
+    return jsonify({
+        'forecasts': forecasts,
+        'total': len(forecasts),
+        'sort': {'field': sort_by, 'order': order},
+        'cache_info': cache_stats
+    })
+
+
+@api_bp.route('/forecast/refresh', methods=['POST'])
+def refresh_forecast_cache():
+    """
+    Refresh the forecast cache for all products.
+    
+    This recalculates all forecasts and stores them in cache.
+    Should be called periodically (e.g., daily) or after data updates.
+    
+    Note: This can take 1-2 minutes for 1000 products.
+    """
+    from app.services.cache_service import cache_service
+    
+    stats = cache_service.refresh_all_forecasts()
+    
+    return jsonify({
+        'message': 'Cache refresh complete',
+        'stats': stats
+    })
+
+
+# =====================================================
+# DYNAMIC FORECAST ROUTES (with <asin> parameter)
+# =====================================================
+
 @api_bp.route('/forecast/<asin>', methods=['GET'])
 def get_forecast_data(asin):
     """
@@ -450,69 +521,3 @@ def calculate_forecast_tps(asin):
     result = forecast_service.run_forecast_tps(asin, custom_settings if custom_settings else None)
     
     return jsonify(result)
-
-
-@api_bp.route('/forecast/all', methods=['GET'])
-def get_all_forecasts():
-    """
-    Get forecast summary for ALL products - FAST (reads from cache).
-    
-    Returns: Brand, Product, Size, Units to Make for ALL products (no pagination).
-    Sorted by DOI Total (ascending) - lowest inventory days first.
-    
-    Query params:
-        - brand: Filter by brand name (optional)
-        - sort: Sort field - 'doi' (default), 'units', 'product', 'fba'
-        - order: 'asc' (default) or 'desc'
-    """
-    from app.services.cache_service import cache_service
-    
-    brand_filter = request.args.get('brand', None)
-    sort_by = request.args.get('sort', 'doi')
-    order = request.args.get('order', 'asc')
-    
-    # Read from cache - INSTANT for 1000+ products
-    forecasts = cache_service.get_all_cached_forecasts(brand_filter)
-    
-    # Sort by DOI (or other field)
-    sort_key = {
-        'doi': 'doi_total_days',
-        'fba': 'doi_fba_days',
-        'units': 'units_to_make',
-        'product': 'product'
-    }.get(sort_by, 'doi_total_days')
-    
-    reverse = (order == 'desc')
-    forecasts.sort(key=lambda x: (x.get(sort_key) or 0) if sort_key != 'product' else (x.get(sort_key) or ''), reverse=reverse)
-    
-    cache_stats = cache_service.get_cache_stats()
-    
-    return jsonify({
-        'forecasts': forecasts,
-        'total': len(forecasts),
-        'sort': {'field': sort_by, 'order': order},
-        'cache_info': cache_stats
-    })
-
-
-@api_bp.route('/forecast/refresh', methods=['POST'])
-def refresh_forecast_cache():
-    """
-    Refresh the forecast cache for all products.
-    
-    This recalculates all forecasts and stores them in cache.
-    Should be called periodically (e.g., daily) or after data updates.
-    
-    Note: This can take 1-2 minutes for 1000 products.
-    """
-    from app.services.cache_service import cache_service
-    
-    # Optional: Add authentication here for production
-    # auth = request.headers.get('Authorization')
-    
-    stats = cache_service.refresh_all_forecasts()
-    
-    return jsonify({
-        'message': 'Cache refresh complete',
-        'stats': stats
-    })
