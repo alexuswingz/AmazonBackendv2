@@ -963,19 +963,27 @@ def get_label_inventory():
         - sort: Sort field - 'inventory' (default), 'product', 'needed'
         - order: 'asc' (default) or 'desc'
     """
-    sort_by = request.args.get('sort', 'inventory')
-    order = request.args.get('order', 'asc')
-    
-    labels = LabelInventory.query.all()
-    
-    results = [{
-        'asin': l.asin,
-        'product_name': l.product_name,
-        'size': l.size,
-        'label_id': l.label_id,
-        'label_status': l.label_status,
-        'label_inventory': l.label_inventory
-    } for l in labels]
+    try:
+        sort_by = request.args.get('sort', 'inventory')
+        order = request.args.get('order', 'asc')
+        
+        labels = LabelInventory.query.all()
+        
+        results = [{
+            'asin': l.asin,
+            'product_name': l.product_name,
+            'size': l.size,
+            'label_id': l.label_id,
+            'label_status': l.label_status,
+            'label_inventory': l.label_inventory
+        } for l in labels]
+    except Exception as e:
+        return jsonify({
+            'error': f'Label inventory table not available: {str(e)}',
+            'labels': [],
+            'total': 0,
+            'total_labels_in_stock': 0
+        }), 200  # Return 200 with empty data instead of 500
     
     # Sort
     sort_key = {
