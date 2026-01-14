@@ -180,7 +180,7 @@ def get_awd_by_asin(asin):
 @api_bp.route('/forecast/all', methods=['GET'])
 def get_all_forecasts():
     """
-    Get forecast summary for ALL products - calculates on-the-fly for 100% accuracy.
+    Get forecast summary for ALL products - FAST with bulk loading + parallel processing.
     
     Returns: Brand, Product, Size, Units to Make for ALL products (no pagination).
     Sorted by DOI Total (ascending) - lowest inventory days first.
@@ -189,86 +189,140 @@ def get_all_forecasts():
         - brand: Filter by brand name (optional)
         - sort: Sort field - 'doi' (default), 'units', 'product', 'fba'
         - order: 'asc' (default) or 'desc'
-        - use_cache: 'true' to use cached values (faster but may be stale)
     """
-    from app.services.forecast_service import forecast_service
     from app.algorithms.algorithms_tps import (
         calculate_forecast_18m_plus as tps_18m,
         DEFAULT_SETTINGS
     )
     from datetime import date
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import time
+    
+    start_time = time.time()
     
     brand_filter = request.args.get('brand', None)
     sort_by = request.args.get('sort', 'doi')
     order = request.args.get('order', 'asc')
-    use_cache = request.args.get('use_cache', 'false').lower() == 'true'
     
-    # If cache requested, use cache service
-    if use_cache:
-        from app.services.cache_service import cache_service
-        forecasts = cache_service.get_all_cached_forecasts(brand_filter)
-        cache_stats = cache_service.get_cache_stats()
-    else:
-        # Calculate on-the-fly for 100% accuracy
-        query = Product.query
-        if brand_filter:
-            query = query.filter(Product.brand.ilike(f'%{brand_filter}%'))
-        
-        products = query.all()
-        today = date.today()
-        forecasts = []
-        
-        for product in products:
-            asin = product.asin
+    today = date.today()
+    
+    # === BULK LOAD ALL DATA UPFRONT (1 query each instead of N queries) ===
+    
+    # Get all products
+    product_query = db.session.query(
+        Product.asin, Product.brand, Product.product_name, Product.size
+    )
+    if brand_filter:
+        product_query = product_query.filter(Product.brand.ilike(f'%{brand_filter}%'))
+    products = {p.asin: p for p in product_query.all()}
+    
+    # Get first sale dates for all products (1 query)
+    first_sales = dict(
+        db.session.query(
+            UnitsSold.asin,
+            func.min(UnitsSold.week_date)
+        ).filter(UnitsSold.units > 0).group_by(UnitsSold.asin).all()
+    )
+    
+    # Get all sales data grouped by ASIN (1 query)
+    all_sales = db.session.query(
+        UnitsSold.asin, UnitsSold.week_date, UnitsSold.units
+    ).order_by(UnitsSold.asin, UnitsSold.week_date).all()
+    
+    sales_by_asin = {}
+    for sale in all_sales:
+        if sale.asin not in sales_by_asin:
+            sales_by_asin[sale.asin] = []
+        sales_by_asin[sale.asin].append({'week_end': sale.week_date, 'units': sale.units})
+    
+    # Get FBA inventory totals (1 query)
+    fba_totals = dict(
+        db.session.query(
+            FBAInventory.asin,
+            func.coalesce(func.sum(FBAInventory.available), 0) + 
+            func.coalesce(func.sum(FBAInventory.inbound_quantity), 0) +
+            func.coalesce(func.sum(FBAInventory.total_reserved_quantity), 0)
+        ).group_by(FBAInventory.asin).all()
+    )
+    
+    fba_available = dict(
+        db.session.query(
+            FBAInventory.asin,
+            func.coalesce(func.sum(FBAInventory.available), 0)
+        ).group_by(FBAInventory.asin).all()
+    )
+    
+    # Get AWD inventory totals (1 query)
+    awd_totals = dict(
+        db.session.query(
+            AWDInventory.asin,
+            func.coalesce(func.sum(AWDInventory.available_in_awd_units), 0) +
+            func.coalesce(func.sum(AWDInventory.inbound_to_awd_units), 0) +
+            func.coalesce(func.sum(AWDInventory.reserved_in_awd_units), 0) +
+            func.coalesce(func.sum(AWDInventory.outbound_to_fba_units), 0)
+        ).group_by(AWDInventory.asin).all()
+    )
+    
+    load_time = time.time() - start_time
+    
+    # === CALCULATE FORECASTS IN PARALLEL ===
+    
+    def calculate_single(asin):
+        try:
+            product = products.get(asin)
+            if not product:
+                return None
             
-            try:
-                # Get first sale date
-                first_sale = db.session.query(func.min(UnitsSold.week_date)).filter(
-                    UnitsSold.asin == asin, UnitsSold.units > 0
-                ).scalar()
-                
-                if not first_sale:
-                    continue
-                
-                # Get sales data
-                sales = UnitsSold.query.filter_by(asin=asin).order_by(UnitsSold.week_date).all()
-                if len(sales) < 4:
-                    continue
-                
-                units_data = [{'week_end': s.week_date, 'units': s.units} for s in sales]
-                
-                # Get inventory
-                inventory = forecast_service.get_inventory_levels(asin)
-                
-                # Settings
-                settings = DEFAULT_SETTINGS.copy()
-                settings['total_inventory'] = inventory.total_inventory
-                settings['fba_available'] = inventory.fba_available
-                
-                # Calculate age and algorithm
-                age_days = (today - first_sale).days
-                age_months = age_days / 30.44
-                algorithm = "18m+" if age_months >= 18 else ("6-18m" if age_months >= 6 else "0-6m")
-                
-                # Run TPS algorithm
-                result = tps_18m(units_data, today, settings)
-                
-                forecasts.append({
-                    'brand': product.brand or 'TPS Plant Foods',
-                    'product': product.product_name,
-                    'size': product.size,
-                    'asin': asin,
-                    'units_to_make': result['units_to_make'],
-                    'doi_total_days': round(result['doi_total_days'], 0),
-                    'doi_fba_days': round(result['doi_fba_days'], 0),
-                    'algorithm': algorithm
-                })
-            except:
-                pass
-        
-        cache_stats = {'source': 'live_calculation', 'products_calculated': len(forecasts)}
+            first_sale = first_sales.get(asin)
+            if not first_sale:
+                return None
+            
+            units_data = sales_by_asin.get(asin, [])
+            if len(units_data) < 4:
+                return None
+            
+            # Get inventory
+            total_inv = int(fba_totals.get(asin, 0) or 0) + int(awd_totals.get(asin, 0) or 0)
+            fba_avail = int(fba_available.get(asin, 0) or 0)
+            
+            # Settings
+            settings = DEFAULT_SETTINGS.copy()
+            settings['total_inventory'] = total_inv
+            settings['fba_available'] = fba_avail
+            
+            # Calculate age
+            age_days = (today - first_sale).days
+            age_months = age_days / 30.44
+            algorithm = "18m+" if age_months >= 18 else ("6-18m" if age_months >= 6 else "0-6m")
+            
+            # Run algorithm
+            result = tps_18m(units_data, today, settings)
+            
+            return {
+                'brand': product.brand or 'TPS Plant Foods',
+                'product': product.product_name,
+                'size': product.size,
+                'asin': asin,
+                'units_to_make': result['units_to_make'],
+                'doi_total_days': round(result['doi_total_days'], 0),
+                'doi_fba_days': round(result['doi_fba_days'], 0),
+                'algorithm': algorithm
+            }
+        except:
+            return None
     
-    # Sort by DOI (or other field)
+    # Run calculations in parallel (8 threads)
+    forecasts = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(calculate_single, asin): asin for asin in products.keys()}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                forecasts.append(result)
+    
+    calc_time = time.time() - start_time - load_time
+    
+    # Sort
     sort_key = {
         'doi': 'doi_total_days',
         'fba': 'doi_fba_days',
@@ -279,11 +333,17 @@ def get_all_forecasts():
     reverse = (order == 'desc')
     forecasts.sort(key=lambda x: (x.get(sort_key) or 0) if sort_key != 'product' else (x.get(sort_key) or ''), reverse=reverse)
     
+    total_time = time.time() - start_time
+    
     return jsonify({
         'forecasts': forecasts,
         'total': len(forecasts),
         'sort': {'field': sort_by, 'order': order},
-        'info': cache_stats
+        'performance': {
+            'data_load_seconds': round(load_time, 2),
+            'calculation_seconds': round(calc_time, 2),
+            'total_seconds': round(total_time, 2)
+        }
     })
 
 
