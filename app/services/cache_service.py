@@ -150,13 +150,26 @@ class CacheService:
                 settings['total_inventory'] = inventory.total_inventory
                 settings['fba_available'] = inventory.fba_available
                 
-                # Run appropriate algorithm
-                if algorithm == "18m+":
+                # Run appropriate algorithm (with fallback to 18m+ if others fail)
+                try:
+                    if algorithm == "18m+":
+                        result = tps_18m(units_data, today, settings)
+                    elif algorithm == "6-18m":
+                        if seasonality_data:
+                            result = tps_6_18m(units_data, today, settings, seasonality_data)
+                        else:
+                            result = tps_18m(units_data, today, settings)
+                            algorithm = "18m+ (fallback)"
+                    else:  # 0-6m
+                        if seasonality_data:
+                            result = tps_0_6m(units_data, today, settings, seasonality_data)
+                        else:
+                            result = tps_18m(units_data, today, settings)
+                            algorithm = "18m+ (fallback)"
+                except Exception as algo_error:
+                    # Fallback to 18m+ if specific algorithm fails
                     result = tps_18m(units_data, today, settings)
-                elif algorithm == "6-18m":
-                    result = tps_6_18m(units_data, today, settings, seasonality_data)
-                else:
-                    result = tps_0_6m(units_data, today, settings, seasonality_data)
+                    algorithm = "18m+ (fallback)"
                 
                 # Prepare cache entry
                 cache_entry = {
