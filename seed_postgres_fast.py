@@ -360,7 +360,7 @@ if __name__ == '__main__':
     if seeded_stats:
         print(f"\nSeeded {total_rows:,} rows in {total_time:.2f}s")
         for table, s in seeded_stats.items():
-            print(f"  ✓ {table}: {s['rows']:,} rows")
+            print(f"  + {table}: {s['rows']:,} rows")
     
     if skipped_stats:
         print(f"\nSkipped (already seeded):")
