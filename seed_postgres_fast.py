@@ -49,6 +49,17 @@ total_start = time.perf_counter()
 stats = {}
 
 
+def table_has_data(table_name):
+    """Check if a table already has data."""
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text(f"SELECT COUNT(*) FROM {table_name}"))
+            count = result.scalar()
+            return count > 0
+    except Exception:
+        return False
+
+
 def fast_copy_insert(df, table_name, engine):
     """
     Use PostgreSQL COPY for fastest bulk insert.
@@ -67,9 +78,14 @@ def fast_copy_insert(df, table_name, engine):
 
 def seed_fba_inventory():
     """Seed FBA Inventory."""
-    print("\n[1/5] Seeding FBA Inventory...")
-    start = time.perf_counter()
+    print("\n[1/6] FBA Inventory...")
     
+    if table_has_data('fba_inventory'):
+        print("    [SKIP] Already seeded")
+        stats['fba_inventory'] = {'rows': 0, 'time': 0, 'skipped': True}
+        return
+    
+    start = time.perf_counter()
     df = pd.read_excel(EXCEL_PATH, sheet_name='FBAInventory')
     
     # Column mapping
@@ -118,9 +134,14 @@ def seed_fba_inventory():
 
 def seed_awd_inventory():
     """Seed AWD Inventory."""
-    print("\n[2/5] Seeding AWD Inventory...")
-    start = time.perf_counter()
+    print("\n[2/6] AWD Inventory...")
     
+    if table_has_data('awd_inventory'):
+        print("    [SKIP] Already seeded")
+        stats['awd_inventory'] = {'rows': 0, 'time': 0, 'skipped': True}
+        return
+    
+    start = time.perf_counter()
     df = pd.read_excel(EXCEL_PATH, sheet_name='AWDInventory', header=2)
     df.columns = df.iloc[0].tolist()
     df = df.iloc[1:].reset_index(drop=True)
@@ -155,9 +176,15 @@ def seed_awd_inventory():
 
 def seed_units_sold():
     """Seed Products and Units Sold."""
-    print("\n[3/5] Seeding Products & Units Sold...")
-    start = time.perf_counter()
+    print("\n[3/6] Products & Units Sold...")
     
+    if table_has_data('products') and table_has_data('units_sold'):
+        print("    [SKIP] Already seeded")
+        stats['products'] = {'rows': 0, 'time': 0, 'skipped': True}
+        stats['units_sold'] = {'rows': 0, 'time': 0, 'skipped': True}
+        return
+    
+    start = time.perf_counter()
     df = pd.read_excel(EXCEL_PATH, sheet_name='Units_Sold')
     
     from datetime import datetime
@@ -198,9 +225,14 @@ def seed_units_sold():
 
 def seed_seasonality():
     """Seed Seasonality data."""
-    print("\n[4/5] Seeding Seasonality...")
-    start = time.perf_counter()
+    print("\n[4/6] Seasonality...")
     
+    if table_has_data('seasonality'):
+        print("    [SKIP] Already seeded")
+        stats['seasonality'] = {'rows': 0, 'time': 0, 'skipped': True}
+        return
+    
+    start = time.perf_counter()
     df = pd.read_excel(EXCEL_PATH, sheet_name='Keyword_Seasonality', header=2)
     
     column_map = {
@@ -225,9 +257,61 @@ def seed_seasonality():
     print(f"    [OK] {len(df):,} rows in {elapsed:.2f}s")
 
 
+def seed_label_inventory():
+    """Seed Label Inventory from 1000 Bananas Database."""
+    print("\n[5/6] Label Inventory...")
+    
+    if table_has_data('label_inventory'):
+        print("    [SKIP] Already seeded")
+        stats['label_inventory'] = {'rows': 0, 'time': 0, 'skipped': True}
+        return
+    
+    start = time.perf_counter()
+    
+    # Path to the label database
+    label_excel_path = Path(__file__).parent.parent / '1000 Bananas Database (6).xlsx'
+    
+    if not label_excel_path.exists():
+        print(f"    [SKIP] Label database not found: {label_excel_path}")
+        stats['label_inventory'] = {'rows': 0, 'time': 0}
+        return
+    
+    try:
+        df = pd.read_excel(label_excel_path, sheet_name='CatalogDataBase', header=3)
+        
+        # Column indices (0-based): Child ASIN (20), Product Name (7), Size (8), 
+        # Label Location (13), label_status (31), label_inventory (32)
+        col_names = df.columns.tolist()
+        
+        # Create DataFrame with specific columns by index
+        data = pd.DataFrame({
+            'asin': df.iloc[:, 20] if len(col_names) > 20 else None,
+            'product_name': df.iloc[:, 7] if len(col_names) > 7 else None,
+            'size': df.iloc[:, 8] if len(col_names) > 8 else None,
+            'label_id': df.iloc[:, 13] if len(col_names) > 13 else None,
+            'label_status': df.iloc[:, 31] if len(col_names) > 31 else None,
+            'label_inventory': df.iloc[:, 32] if len(col_names) > 32 else None,
+        })
+        
+        # Clean data
+        data = data.dropna(subset=['asin', 'label_id'])
+        data['label_inventory'] = pd.to_numeric(data['label_inventory'], errors='coerce').fillna(0).astype(int)
+        data['label_status'] = data['label_status'].fillna('Unknown')
+        data = data.drop_duplicates(subset=['asin'], keep='first')
+        
+        fast_copy_insert(data, 'label_inventory', engine)
+        
+        elapsed = time.perf_counter() - start
+        stats['label_inventory'] = {'rows': len(data), 'time': elapsed}
+        print(f"    [OK] {len(data):,} rows in {elapsed:.2f}s")
+    except Exception as e:
+        print(f"    [ERROR] Failed to seed labels: {e}")
+        stats['label_inventory'] = {'rows': 0, 'time': 0}
+
+
 def optimize_database():
     """Run ANALYZE to optimize query planner."""
-    print("\n[5/5] Optimizing database...")
+    print("\n[6/6] Optimizing database...")
     start = time.perf_counter()
     
     with engine.connect() as conn:
@@ -239,15 +323,14 @@ def optimize_database():
 
 
 def create_schema():
-    """Create database schema."""
-    print("\n[PREP] Creating schema...")
+    """Create database schema (only creates missing tables)."""
+    print("\n[PREP] Checking schema...")
     from app import create_app, db
     app = create_app('production')
     with app.app_context():
-        # Drop all tables first for clean start
-        db.drop_all()
+        # Only create tables that don't exist (don't drop existing data)
         db.create_all()
-    print("    [OK] Schema created with indexes")
+    print("    [OK] Schema ready")
 
 
 if __name__ == '__main__':
@@ -259,20 +342,30 @@ if __name__ == '__main__':
     seed_awd_inventory()
     seed_units_sold()
     seed_seasonality()
+    seed_label_inventory()
     
     # Optimize
     optimize_database()
     
     # Summary
     total_time = time.perf_counter() - total_start
-    total_rows = sum(s['rows'] for s in stats.values())
+    seeded_stats = {k: v for k, v in stats.items() if not v.get('skipped')}
+    skipped_stats = {k: v for k, v in stats.items() if v.get('skipped')}
+    total_rows = sum(s['rows'] for s in seeded_stats.values())
     
     print("\n" + "=" * 70)
     print("SEEDING COMPLETE!")
     print("=" * 70)
-    print(f"\nTotal rows: {total_rows:,}")
-    print(f"Total time: {total_time:.2f}s")
-    print(f"Average rate: {total_rows/total_time:.0f} rows/sec")
-    print("\nBreakdown:")
-    for table, s in stats.items():
-        print(f"  - {table}: {s['rows']:,} rows")
+    
+    if seeded_stats:
+        print(f"\nSeeded {total_rows:,} rows in {total_time:.2f}s")
+        for table, s in seeded_stats.items():
+            print(f"  ✓ {table}: {s['rows']:,} rows")
+    
+    if skipped_stats:
+        print(f"\nSkipped (already seeded):")
+        for table in skipped_stats.keys():
+            print(f"  - {table}")
+    
+    if not seeded_stats:
+        print("\nAll tables already seeded - nothing to do!")
