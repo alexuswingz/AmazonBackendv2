@@ -176,45 +176,124 @@ def get_awd_by_asin(asin):
 @api_bp.route('/forecast/<asin>', methods=['GET'])
 def get_forecast_data(asin):
     """
-    Get combined data for forecasting analysis.
-    Returns sales history, current inventory levels.
+    Get complete forecast for a product - matching Excel Settings page output.
+    
+    Returns:
+        - Product Info (ASIN, Product, Size)
+        - Total Inventory
+        - Production Forecast (Units to Make, DOI Total, DOI FBA Available)
+        - Product Age (days, weeks, months, years)
+        - Global Settings used
     """
+    from app.services.forecast_service import forecast_service
+    from app.algorithms.algorithms_tps import (
+        calculate_forecast_18m_plus as tps_18m,
+        calculate_forecast_6_18m as tps_6_18m,
+        calculate_forecast_0_6m_exact as tps_0_6m,
+        DEFAULT_SETTINGS
+    )
+    from datetime import date
+    
     # Get product info
     product = Product.query.filter_by(asin=asin).first()
+    if not product:
+        return jsonify({'error': f'Product not found: {asin}'}), 404
+    
+    # Get product age
+    first_sale = db.session.query(func.min(UnitsSold.week_date)).filter(
+        UnitsSold.asin == asin, UnitsSold.units > 0
+    ).scalar()
+    
+    if not first_sale:
+        return jsonify({'error': 'No sales history for product'}), 404
+    
+    today = date.today()
+    age_days = (today - first_sale).days
+    age_weeks = age_days / 7
+    age_months = age_days / 30.44
+    age_years = age_days / 365.25
+    
+    # Determine algorithm
+    if age_months >= 18:
+        algorithm = "18m+"
+    elif age_months >= 6:
+        algorithm = "6-18m"
+    else:
+        algorithm = "0-6m"
     
     # Get sales data
     sales = UnitsSold.query.filter_by(asin=asin).order_by(UnitsSold.week_date).all()
+    units_data = [{'week_end': s.week_date, 'units': s.units} for s in sales]
     
-    # Get current FBA inventory
-    fba_inv = FBAInventory.query.filter_by(asin=asin).first()
+    # Get inventory levels (aggregated across SKUs)
+    inventory = forecast_service.get_inventory_levels(asin)
+    total_inventory = inventory.total_inventory
+    fba_available = inventory.fba_available
     
-    # Get current AWD inventory
-    awd_inv = AWDInventory.query.filter_by(asin=asin).first()
+    # Settings
+    settings = DEFAULT_SETTINGS.copy()
+    settings['total_inventory'] = total_inventory
+    settings['fba_available'] = fba_available
     
+    # Run the appropriate algorithm
+    if algorithm == "18m+":
+        result = tps_18m(units_data, today, settings)
+        units_to_make = result['units_to_make']
+        doi_total = result['doi_total_days']
+        doi_fba = result['doi_fba_days']
+        velocity_adj = result.get('sales_velocity_adjustment', 0)
+    elif algorithm == "6-18m":
+        # Get seasonality data from database
+        from app.models import Seasonality
+        seasonality = Seasonality.query.all()
+        seasonality_data = [{'week_of_year': s.week_of_year, 'seasonality_index': s.seasonality_index} for s in seasonality]
+        result = tps_6_18m(units_data, today, settings, seasonality_data)
+        units_to_make = result['units_to_make']
+        doi_total = result['doi_total_days']
+        doi_fba = result['doi_fba_days']
+        velocity_adj = 0
+    else:  # 0-6m
+        from app.models import Seasonality
+        seasonality = Seasonality.query.all()
+        seasonality_data = [{'week_of_year': s.week_of_year, 'seasonality_index': s.seasonality_index} for s in seasonality]
+        result = tps_0_6m(units_data, today, settings, seasonality_data)
+        units_to_make = result['units_to_make']
+        doi_total = result['doi_total_days']
+        doi_fba = result['doi_fba_days']
+        velocity_adj = 0
+    
+    # Build response matching Excel Settings page
     return jsonify({
-        'product': {
-            'asin': asin,
-            'brand': product.brand if product else None,
-            'name': product.product_name if product else None,
-            'size': product.size if product else None
+        'product_info': {
+            'child_asin': asin,
+            'product': product.product_name,
+            'size': product.size
         },
-        'sales_history': [{
-            'week': s.week_date.isoformat(),
-            'units': s.units
-        } for s in sales],
-        'fba_inventory': {
-            'available': fba_inv.available if fba_inv else 0,
-            'days_of_supply': fba_inv.days_of_supply if fba_inv else 0,
-            'inbound': fba_inv.inbound_quantity if fba_inv else 0,
-        } if fba_inv else None,
-        'awd_inventory': {
-            'available_units': awd_inv.available_in_awd_units if awd_inv else 0,
-            'available_cases': awd_inv.available_in_awd_cases if awd_inv else 0,
-        } if awd_inv else None,
-        'metrics': {
-            'total_weeks': len(sales),
-            'total_units_sold': sum(s.units for s in sales),
-            'avg_weekly_units': round(sum(s.units for s in sales) / len(sales), 2) if sales else 0
+        'total_inventory': total_inventory,
+        'production_forecast': {
+            'algorithm': algorithm,
+            'units_to_make': units_to_make,
+            'doi_total_days': round(doi_total, 0),
+            'doi_fba_available_days': round(doi_fba, 0)
+        },
+        'product_age': {
+            'days': round(age_days, 0),
+            'weeks': round(age_weeks, 0),
+            'months': round(age_months, 1),
+            'years': round(age_years, 1)
+        },
+        'global_settings': {
+            'amazon_doi_goal': settings.get('amazon_doi_goal', 93),
+            'inbound_lead_time': settings.get('inbound_lead_time', 30),
+            'manufacture_lead_time': settings.get('manufacture_lead_time', 7),
+            'total_lead_time_days': settings.get('inbound_lead_time', 30) + settings.get('manufacture_lead_time', 7),
+            'total_doi_days_goal': settings.get('amazon_doi_goal', 93) + settings.get('inbound_lead_time', 30) + settings.get('manufacture_lead_time', 7),
+            'total_doi_weeks_goal': round((settings.get('amazon_doi_goal', 93) + settings.get('inbound_lead_time', 30) + settings.get('manufacture_lead_time', 7)) / 7, 1)
+        },
+        'algorithm_settings': {
+            'market_adjustment': f"{settings.get('market_adjustment', 0.05) * 100:.2f}%",
+            'sales_velocity_adjustment': f"{velocity_adj * 100:.2f}%" if algorithm == "18m+" else "N/A",
+            'sales_velocity_adjustment_weight': f"{settings.get('velocity_weight', 0.15) * 100:.0f}%" if algorithm == "18m+" else "N/A"
         }
     })
 
