@@ -329,7 +329,7 @@ def get_all_forecasts():
             elif algorithm == "6-18m":
                 result = tps_6_18m(units_data, seasonality_data, today, settings)
             else:  # 0-6m
-                result = tps_0_6m(units_data, seasonality_data, today, settings)
+                result = tps_0_6m(units_data, seasonality_data, None, today, settings)
             
             return {
                 'brand': product.brand or 'TPS Plant Foods',
