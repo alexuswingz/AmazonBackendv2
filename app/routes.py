@@ -723,8 +723,11 @@ def get_forecast_chart(asin):
     """
     from app.algorithms.algorithms_tps import (
         calculate_forecast_18m_plus as tps_18m,
+        calculate_forecast_6_18m as tps_6_18m,
+        calculate_forecast_0_6m_exact as tps_0_6m,
         DEFAULT_SETTINGS
     )
+    from app.models import Seasonality, VineClaims
     from datetime import date, timedelta, datetime
     
     today = date.today()
@@ -752,6 +755,18 @@ def get_forecast_chart(asin):
         algorithm = "6-18m"
     else:
         algorithm = "0-6m"
+    
+    # Get seasonality data (for 6-18m and 0-6m)
+    seasonality = Seasonality.query.all()
+    seasonality_data = [{
+        'week_of_year': s.week_of_year, 
+        'seasonality_index': s.seasonality_index,
+        'sv_smooth_env_97': s.sv_smooth_env_97
+    } for s in seasonality]
+    
+    # Get vine claims
+    vine_records = VineClaims.query.filter_by(asin=asin).all()
+    vine_claims = [{'claim_date': v.claim_date, 'units_claimed': v.units_claimed} for v in vine_records]
     
     # Get sales data
     sales = UnitsSold.query.filter_by(asin=asin).order_by(UnitsSold.week_date).all()
@@ -796,73 +811,159 @@ def get_forecast_chart(asin):
     settings['total_inventory'] = total_inventory
     settings['fba_available'] = fba_available
     
-    # Run the TPS algorithm with full details
-    result = tps_18m(units_data, today, settings)
+    # Run the appropriate algorithm based on product age
+    if algorithm == "18m+":
+        result = tps_18m(units_data, today, settings)
+        velocity_adj = result.get('sales_velocity_adjustment', 0)
+    elif algorithm == "6-18m":
+        result = tps_6_18m(units_data, seasonality_data, today, settings, vine_claims)
+        velocity_adj = 0
+    else:  # 0-6m
+        result = tps_0_6m(units_data, seasonality_data, vine_claims, today, settings)
+        velocity_adj = 0
     
     units_to_make = result['units_to_make']
     doi_total = result.get('doi_total_days', 0)
     doi_fba = result.get('doi_fba_days', 0)
-    velocity_adj = result.get('sales_velocity_adjustment', 0)
     
     # Calculate DOI goal date
     doi_goal = settings.get('amazon_doi_goal', 93) + settings.get('inbound_lead_time', 30) + settings.get('manufacture_lead_time', 7)
     doi_goal_date = today + timedelta(days=doi_goal)
     
-    # Build historical data with smoothing
-    historical = []
+    # Build algorithm-specific chart data
     units_list = [s['units'] for s in units_data]
-    
-    for i, sale in enumerate(units_data):
-        # Calculate 5-week moving average for smoothing (similar to chart)
-        start_idx = max(0, i - 2)
-        end_idx = min(len(units_list), i + 3)
-        window = units_list[start_idx:end_idx]
-        units_smooth = sum(window) / len(window) if window else 0
-        
-        # Safely format week_end
-        week_end = sale['week_end']
-        if hasattr(week_end, 'isoformat'):
-            week_end_str = week_end.isoformat()
-        else:
-            week_end_str = str(week_end)
-        
-        historical.append({
-            'week_end': week_end_str,
-            'units_sold': sale['units'],
-            'units_smooth': round(units_smooth, 1)
-        })
-    
-    # Build forecast data (future weeks) using algorithm's actual forecast values
-    forecast_weeks = []
-    
-    # Get the weekly forecasts from the algorithm result (includes seasonality)
     algorithm_forecasts = result.get('forecasts', [])
     
-    # Get weekly average from the algorithm result for fallback
+    # Get weekly average for fallback
     weekly_forecast_avg = 0
     if algorithm_forecasts:
         forecast_values = [f.get('forecast', 0) for f in algorithm_forecasts if f.get('forecast', 0) > 0]
         weekly_forecast_avg = sum(forecast_values) / len(forecast_values) if forecast_values else 0
     elif len(units_list) > 0:
-        # Calculate from recent data if not available
         recent_weeks = units_list[-13:] if len(units_list) >= 13 else units_list
         weekly_forecast_avg = sum(recent_weeks) / len(recent_weeks) if recent_weeks else 0
     
-    # Use algorithm's forecasts (has seasonality-adjusted values)
+    market_adj = settings.get('market_adjustment', 0.05)
+    
+    # Build seasonality lookup for chart series
+    seasonality_lookup = {s['week_of_year']: s['seasonality_index'] for s in seasonality_data}
+    sv_smooth_lookup = {s['week_of_year']: s.get('sv_smooth_env_97', 3000) for s in seasonality_data}
+    
+    # Build vine claims lookup by (year, week)
+    vine_lookup = {}
+    for vc in vine_claims:
+        claim_date = vc.get('claim_date')
+        if claim_date:
+            iso_cal = claim_date.isocalendar()
+            key = (iso_cal[0], iso_cal[1])
+            vine_lookup[key] = vine_lookup.get(key, 0) + (vc.get('units_claimed', 0) or 0)
+    
+    # Build historical data - different series based on algorithm
+    historical = []
+    
+    if algorithm == "18m+":
+        # 18m+: units_sold, units_sold_smoothed, forecast (historical portion), prior_year_smoothed
+        for i, sale in enumerate(units_data):
+            week_end = sale['week_end']
+            week_end_str = week_end.isoformat() if hasattr(week_end, 'isoformat') else str(week_end)
+            
+            # 5-week smoothing
+            start_idx = max(0, i - 2)
+            end_idx = min(len(units_list), i + 3)
+            window = units_list[start_idx:end_idx]
+            units_smooth = sum(window) / len(window) if window else 0
+            
+            # Prior year (52 weeks back)
+            prior_idx = i - 52
+            prior_year_smooth = 0
+            if prior_idx >= 0:
+                py_start = max(0, prior_idx - 2)
+                py_end = min(len(units_list), prior_idx + 3)
+                py_window = units_list[py_start:py_end]
+                prior_year_smooth = sum(py_window) / len(py_window) if py_window else 0
+            
+            historical.append({
+                'week_end': week_end_str,
+                'units_sold': sale['units'],
+                'units_sold_smoothed': round(units_smooth, 1),
+                'prior_year_smoothed': round(prior_year_smooth, 1)
+            })
+    
+    elif algorithm == "6-18m":
+        # 6-18m: units_sold, units_sold_potential, forecast
+        # Calculate F_constant (peak CVR) from result
+        F_constant = result.get('F_constant', 0.005)
+        
+        for i, sale in enumerate(units_data):
+            week_end = sale['week_end']
+            week_end_str = week_end.isoformat() if hasattr(week_end, 'isoformat') else str(week_end)
+            week_of_year = week_end.isocalendar()[1] if hasattr(week_end, 'isocalendar') else 1
+            
+            # Adjusted units (vine claims subtracted)
+            iso_cal = week_end.isocalendar() if hasattr(week_end, 'isocalendar') else (2025, 1, 1)
+            vine_key = (iso_cal[0], iso_cal[1])
+            vine = vine_lookup.get(vine_key, 0)
+            adj_units = max(0, sale['units'] - vine)
+            
+            # Units sold potential (Column I in Excel: D × H)
+            sv_97 = sv_smooth_lookup.get(week_of_year, 3000)
+            seasonality_idx = seasonality_lookup.get(week_of_year, 1.0)
+            H = F_constant * (1 + 0.25 * (seasonality_idx - 1))
+            units_potential = sv_97 * H
+            
+            historical.append({
+                'week_end': week_end_str,
+                'units_sold': adj_units,
+                'units_sold_potential': round(units_potential, 1),
+                'forecast': round(units_potential, 1) if week_end > today else 0
+            })
+    
+    else:  # 0-6m
+        # 0-6m: adj_units_sold, max_week_seasonality_index_applied
+        F_peak = result.get('F_peak', max(units_list) if units_list else 0)
+        
+        # Find current seasonality index (last historical week)
+        last_week = units_data[-1]['week_end'] if units_data else today
+        last_week_of_year = last_week.isocalendar()[1] if hasattr(last_week, 'isocalendar') else 1
+        current_seasonality = seasonality_lookup.get(last_week_of_year, 1.0)
+        
+        for i, sale in enumerate(units_data):
+            week_end = sale['week_end']
+            week_end_str = week_end.isoformat() if hasattr(week_end, 'isoformat') else str(week_end)
+            week_of_year = week_end.isocalendar()[1] if hasattr(week_end, 'isocalendar') else 1
+            
+            # Adjusted units (vine claims subtracted)
+            iso_cal = week_end.isocalendar() if hasattr(week_end, 'isocalendar') else (2025, 1, 1)
+            vine_key = (iso_cal[0], iso_cal[1])
+            vine = vine_lookup.get(vine_key, 0)
+            adj_units = max(0, sale['units'] - vine)
+            
+            # max_week_seasonality_index_applied (Column H in Excel)
+            seasonality_idx = seasonality_lookup.get(week_of_year, 1.0)
+            if current_seasonality > 0:
+                max_week_seasonality = F_peak * pow(seasonality_idx / current_seasonality, 0.65)
+            else:
+                max_week_seasonality = F_peak
+            
+            historical.append({
+                'week_end': week_end_str,
+                'adj_units_sold': adj_units,
+                'max_week_seasonality_index_applied': round(max_week_seasonality, 1)
+            })
+    
+    # Build forecast data
+    forecast_weeks = []
     if algorithm_forecasts:
         for forecast_item in algorithm_forecasts:
             week_end = forecast_item.get('week_end')
             forecast_val = forecast_item.get('forecast', 0)
             forecast_weeks.append({
                 'week_end': week_end,
-                'units_smooth': round(forecast_val, 1),
-                'adj_forecast': round(forecast_val, 1)
+                'forecast': round(forecast_val, 1)
             })
     
-    # Extend to 104 weeks if needed
+    # Extend forecast if needed
     last_date = units_data[-1]['week_end'] if units_data else today
-    
-    # Safely get last forecast date
     last_forecast_date = last_date
     if algorithm_forecasts and len(algorithm_forecasts) > 0:
         last_week_end = algorithm_forecasts[-1].get('week_end')
@@ -875,28 +976,58 @@ def get_forecast_chart(asin):
             elif hasattr(last_week_end, 'isoformat'):
                 last_forecast_date = last_week_end
     
-    # Fill remaining weeks up to 104 total
-    market_adj = settings.get('market_adjustment', 0.05)
     base_forecast = weekly_forecast_avg * (1 + market_adj)
-    
     existing_forecast_count = len(forecast_weeks)
     while len(forecast_weeks) < 104:
         weeks_to_add = len(forecast_weeks) - existing_forecast_count + 1
         next_date = last_forecast_date + timedelta(weeks=weeks_to_add)
         forecast_weeks.append({
             'week_end': next_date.isoformat(),
-            'units_smooth': round(base_forecast, 1),
-            'adj_forecast': round(base_forecast, 1)
+            'forecast': round(base_forecast, 1)
         })
     
     # Calculate labels needed
     labels_needed = max(0, units_to_make - label_inventory)
     labels_have_enough = label_inventory >= units_to_make
     
+    # Define chart series based on algorithm
+    if algorithm == "18m+":
+        chart_series = {
+            'historical': ['units_sold', 'units_sold_smoothed', 'prior_year_smoothed'],
+            'forecast': ['forecast'],
+            'legend': {
+                'units_sold': 'Units Sold',
+                'units_sold_smoothed': 'Units Sold Smoothed',
+                'prior_year_smoothed': 'Prior Year Smoothed',
+                'forecast': 'Forecast'
+            }
+        }
+    elif algorithm == "6-18m":
+        chart_series = {
+            'historical': ['units_sold', 'units_sold_potential'],
+            'forecast': ['forecast'],
+            'legend': {
+                'units_sold': 'Units Sold',
+                'units_sold_potential': 'Units Sold Potential',
+                'forecast': 'Forecast'
+            }
+        }
+    else:  # 0-6m
+        chart_series = {
+            'historical': ['adj_units_sold', 'max_week_seasonality_index_applied'],
+            'forecast': ['forecast'],
+            'legend': {
+                'adj_units_sold': 'Adj. Units Sold',
+                'max_week_seasonality_index_applied': 'Max Week Seasonality Applied',
+                'forecast': 'Forecast'
+            }
+        }
+    
     return jsonify({
         'success': True,
         'asin': asin,
         'algorithm': algorithm,
+        'chart_series': chart_series,
         'product': {
             'name': product.product_name,
             'size': product.size,
