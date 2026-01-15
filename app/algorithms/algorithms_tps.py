@@ -877,20 +877,19 @@ def calculate_forecast_6_18m(
             'settings': settings
         }
     
-    # Build per-product search volume lookups (optional, for future use)
-    # Currently disabled - using global seasonality for sv_smooth_env_97
-    # because Excel appears to use global data, not per-product sv_database
+    # Build per-product search volume lookups from sv_database
+    # Excel auto-pulls seasonality data per child ASIN from sv_database
+    # Priority: per-product SV > global seasonality (fallback)
     product_sv_by_date = {}  # week_date → search_volume
-    product_sv_by_week = {}  # week_of_year → search_volume
-    # NOTE: Per-product SV is available but not used in current algorithm
-    # Uncomment to enable per-product SV:
-    # for sv in product_search_volume:
-    #     week_date = parse_date(sv.get('week_date'))
-    #     if week_date:
-    #         sv_val = sv.get('search_volume', 0) or 0
-    #         product_sv_by_date[week_date] = sv_val
-    #         week_of_year = week_date.isocalendar()[1]
-    #         product_sv_by_week[week_of_year] = sv_val
+    product_sv_by_week = {}  # week_of_year → search_volume (for cyclical future dates)
+    for sv in product_search_volume:
+        week_date = parse_date(sv.get('week_date'))
+        if week_date:
+            sv_val = sv.get('search_volume', 0) or 0
+            product_sv_by_date[week_date] = sv_val
+            # Also store by week_of_year for cyclical future date lookups
+            week_of_year = week_date.isocalendar()[1]
+            product_sv_by_week[week_of_year] = sv_val
     
     # Build GLOBAL seasonality lookups by week number (fallback for D, primary for G)
     # D = sv_smooth_env_97 (search volume), G = seasonality_index
@@ -931,13 +930,21 @@ def calculate_forecast_6_18m(
             units.append(raw_units)
     
     # Column D: Get search volume for each week
-    # Using global sv_smooth_env_97 from Keyword_Seasonality (matches Excel behavior)
+    # Priority: 1) per-product by exact date, 2) per-product by week_of_year (cyclical), 3) global fallback
     D_values = []
     for d in units_data:
         week_end = parse_date(d.get('week_end'))
         if week_end:
             week_of_year = week_end.isocalendar()[1]
-            D_values.append(sv_smooth_97_lookup.get(week_of_year, 3000))
+            # Try per-product search volume first (exact date match)
+            if product_sv_by_date and week_end in product_sv_by_date:
+                D_values.append(product_sv_by_date[week_end])
+            # Then try per-product by week_of_year (cyclical for dates outside sv_database range)
+            elif product_sv_by_week and week_of_year in product_sv_by_week:
+                D_values.append(product_sv_by_week[week_of_year])
+            else:
+                # Fallback to global seasonality
+                D_values.append(sv_smooth_97_lookup.get(week_of_year, 3000))
         else:
             D_values.append(3000)
     
@@ -999,9 +1006,13 @@ def calculate_forecast_6_18m(
         if future_date not in extended_dates:
             extended_dates.append(future_date)
             
-            # Get search volume for future week (global sv_smooth_env_97)
+            # Get search volume for future week
+            # Priority: per-product by week_of_year (cyclical) > global fallback
             week_of_year = future_date.isocalendar()[1]
-            d_val = sv_smooth_97_lookup.get(week_of_year, 3000)
+            if product_sv_by_week and week_of_year in product_sv_by_week:
+                d_val = product_sv_by_week[week_of_year]  # Use per-product SV cyclically
+            else:
+                d_val = sv_smooth_97_lookup.get(week_of_year, 3000)  # Global fallback
             
             g_val = seasonality_idx_lookup.get(week_of_year, 1.0)
             h_val = F_constant * (1 + 0.25 * (g_val - 1))
