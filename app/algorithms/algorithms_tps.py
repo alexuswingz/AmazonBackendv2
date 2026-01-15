@@ -893,12 +893,64 @@ def calculate_forecast_6_18m(
             week_of_year = week_date.isocalendar()[1]
             raw_sv_by_week[week_of_year] = sv_val
     
-    # Use per-product SV values directly from sv_database
-    # Note: Excel applies additional smoothing (sv_smooth_env_.97) which we approximate
-    # by using the raw values. For exact match, would need Excel's peak envelope formulas.
+    # Apply Excel's smoothing formula chain to get sv_smooth_env_.97
+    # B = raw search_volume from sv_database
+    # C = sv_peak_env = MAX(OFFSET(B,-2,0,3)) - max of 3 cells ending at current
+    # D = sv_peak_env_offset = (C[i] + C[i+1]) / 2
+    # E = sv_smooth_env = AVERAGE(OFFSET(D,-1,0,3)) - 3-row centered average
+    # F = sv_final_curve = AVERAGE(B, D, E)
+    # G = sv_smooth = AVERAGE(F[i], F[i+1])
+    # H = sv_smooth_env = (G[i] + G[i+1]) / 2
+    # I = sv_smooth_env_.97 = H * 0.97
     if raw_sv_by_week:
-        for week, sv_val in raw_sv_by_week.items():
-            product_sv_by_week[week] = sv_val
+        # Get raw values as list (weeks 1-52)
+        B = [raw_sv_by_week.get(w, 0) for w in range(1, 53)]
+        
+        # C: sv_peak_env = MAX of 3 cells ending at current (looking back 2)
+        C = []
+        for i in range(52):
+            start = max(0, i - 2)
+            C.append(max(B[start:i+1]))
+        
+        # D: sv_peak_env_offset = (C[i] + C[i+1]) / 2
+        D = []
+        for i in range(52):
+            if i < 51:
+                D.append((C[i] + C[i+1]) / 2)
+            else:
+                D.append(C[i])  # Last row: just use C
+        
+        # E: sv_smooth_env = 3-row centered average of D
+        E = []
+        for i in range(52):
+            start = max(0, i - 1)
+            end = min(52, i + 2)
+            window = D[start:end]
+            E.append(sum(window) / len(window))
+        
+        # F: sv_final_curve = AVERAGE(B, D, E)
+        F = [(B[i] + D[i] + E[i]) / 3 for i in range(52)]
+        
+        # G: sv_smooth = AVERAGE(F[i], F[i+1])
+        G = []
+        for i in range(52):
+            if i < 51:
+                G.append((F[i] + F[i+1]) / 2)
+            else:
+                G.append(F[i])
+        
+        # H: sv_smooth_env = (G[i] + G[i+1]) / 2
+        H = []
+        for i in range(52):
+            if i < 51:
+                H.append((G[i] + G[i+1]) / 2)
+            else:
+                H.append(G[i])
+        
+        # I: sv_smooth_env_.97 = H * 0.97
+        for i in range(52):
+            week = i + 1
+            product_sv_by_week[week] = H[i] * 0.97
     
     # Build GLOBAL seasonality lookups by week number (fallback for D, primary for G)
     # D = sv_smooth_env_97 (search volume), G = seasonality_index
