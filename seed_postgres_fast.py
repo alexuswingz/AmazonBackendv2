@@ -354,9 +354,71 @@ def seed_vine_claims():
         stats['vine_claims'] = {'rows': 0, 'time': 0}
 
 
+def seed_product_search_volume():
+    """Seed per-product search volume from sv_database."""
+    print("\n[7/8] Product Search Volume...")
+    
+    if table_has_data('product_search_volume'):
+        print("    [SKIP] Already seeded")
+        stats['product_search_volume'] = {'rows': 0, 'time': 0, 'skipped': True}
+        return
+    
+    try:
+        start = time.perf_counter()
+        
+        # Read sv_database sheet
+        df = pd.read_excel(EXCEL_PATH, sheet_name='sv_database', header=None)
+        
+        # Get week dates from row 0 (columns D onwards = index 3+)
+        week_dates = df.iloc[0, 3:].tolist()
+        
+        # Process each product row (skip header rows 0-1)
+        records = []
+        for row_idx in range(2, len(df)):
+            asin = df.iloc[row_idx, 1]  # Column B = Child ASIN
+            if pd.isna(asin) or not asin:
+                continue
+                
+            # Get search volume for each week
+            for col_idx, week_date in enumerate(week_dates):
+                if pd.isna(week_date):
+                    continue
+                    
+                sv = df.iloc[row_idx, col_idx + 3]  # Column D onwards
+                if pd.isna(sv):
+                    sv = 0
+                
+                # Convert week_date to date
+                if hasattr(week_date, 'date'):
+                    week_date = week_date.date()
+                elif isinstance(week_date, str):
+                    week_date = pd.to_datetime(week_date).date()
+                
+                records.append({
+                    'asin': str(asin),
+                    'week_date': week_date,
+                    'search_volume': float(sv) if sv else 0
+                })
+        
+        # Convert to DataFrame and insert
+        data = pd.DataFrame(records)
+        data = data.drop_duplicates(subset=['asin', 'week_date'])
+        
+        fast_copy_insert(data, 'product_search_volume', engine)
+        
+        elapsed = time.perf_counter() - start
+        stats['product_search_volume'] = {'rows': len(data), 'time': elapsed}
+        print(f"    [OK] {len(data):,} rows in {elapsed:.2f}s")
+    except Exception as e:
+        print(f"    [ERROR] Failed to seed product search volume: {e}")
+        import traceback
+        traceback.print_exc()
+        stats['product_search_volume'] = {'rows': 0, 'time': 0}
+
+
 def optimize_database():
     """Run ANALYZE to optimize query planner."""
-    print("\n[7/7] Optimizing database...")
+    print("\n[8/8] Optimizing database...")
     start = time.perf_counter()
     
     with engine.connect() as conn:
@@ -389,6 +451,7 @@ if __name__ == '__main__':
     seed_seasonality()
     seed_label_inventory()
     seed_vine_claims()
+    seed_product_search_volume()
     
     # Optimize
     optimize_database()

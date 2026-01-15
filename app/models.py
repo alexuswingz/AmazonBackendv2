@@ -301,3 +301,29 @@ class VineClaims(db.Model):
     
     def __repr__(self):
         return f'<VineClaims {self.asin} @ {self.claim_date}: {self.units_claimed}>'
+
+
+class ProductSearchVolume(db.Model):
+    """
+    Per-product search volume data by week.
+    
+    Each product has its own unique search volume curve.
+    Used by 6-18m algorithm for per-product seasonality (sv_smooth_env_97).
+    Data comes from sv_database sheet in Excel.
+    """
+    __tablename__ = 'product_search_volume'
+    
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    asin = db.Column(db.String(50), index=True, nullable=False)
+    week_date = db.Column(db.Date, index=True, nullable=False)
+    search_volume = db.Column(db.Float, default=0)
+    
+    __table_args__ = (
+        # Composite index for ASIN + date lookups (most common query)
+        db.Index('ix_product_sv_asin_date', 'asin', 'week_date'),
+        # Unique constraint
+        db.UniqueConstraint('asin', 'week_date', name='uq_product_sv'),
+    )
+    
+    def __repr__(self):
+        return f'<ProductSearchVolume {self.asin} @ {self.week_date}: {self.search_volume}>'

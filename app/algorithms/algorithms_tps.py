@@ -840,17 +840,18 @@ def calculate_forecast_6_18m(
     seasonality_data: List[Dict],
     today: date = None,
     settings: Dict = None,
-    vine_claims: List[Dict] = None
+    vine_claims: List[Dict] = None,
+    product_search_volume: List[Dict] = None
 ) -> Dict:
     """
     Calculate 6-18 month forecast exactly as Excel does (forecast_6m-18m_V2 sheet).
     
     Excel formula chain:
     C = units_sold (adjusted for vine claims if provided)
-    D = sv_smooth_env_97 (search volume from Keyword_Seasonality!I)
+    D = sv_smooth_env_97 (search volume - per-product from sv_database, or global fallback)
     E = C/D (conversion rate = sales / search volume)
     F = avg peak CVR (constant $F$3, average around max E)
-    G = seasonality_index (from Keyword_Seasonality!J)
+    G = seasonality_index (from Keyword_Seasonality!J - global)
     H = F × (1 + 0.25 × (G - 1)) (25% weighted CVR)
     I = D × H (forecast = search volume × adjusted CVR)
     J = I for future weeks (forecast column)
@@ -864,6 +865,9 @@ def calculate_forecast_6_18m(
     if vine_claims is None:
         vine_claims = []
     
+    if product_search_volume is None:
+        product_search_volume = []
+    
     if not units_data:
         return {
             'units_to_make': 0,
@@ -873,9 +877,16 @@ def calculate_forecast_6_18m(
             'settings': settings
         }
     
-    # Build seasonality lookups by week number
+    # Build per-product search volume lookup by week_date (primary source for Column D)
+    product_sv_lookup = {}  # week_date → search_volume
+    for sv in product_search_volume:
+        week_date = parse_date(sv.get('week_date'))
+        if week_date:
+            product_sv_lookup[week_date] = sv.get('search_volume', 0) or 0
+    
+    # Build GLOBAL seasonality lookups by week number (fallback for D, primary for G)
     # D = sv_smooth_env_97 (search volume), G = seasonality_index
-    sv_smooth_97_lookup = {}  # Column D (sv_smooth_env_97)
+    sv_smooth_97_lookup = {}  # Column D fallback (sv_smooth_env_97)
     seasonality_idx_lookup = {}  # Column G (seasonality_index)
     
     for s in seasonality_data:
@@ -911,13 +922,19 @@ def calculate_forecast_6_18m(
         else:
             units.append(raw_units)
     
-    # Column D: Get sv_smooth_env_97 for each week
+    # Column D: Get search volume for each week
+    # Priority: per-product search volume (by exact date) > global sv_smooth_env_97 (by week_of_year)
     D_values = []
     for d in units_data:
         week_end = parse_date(d.get('week_end'))
         if week_end:
-            week_of_year = week_end.isocalendar()[1]
-            D_values.append(sv_smooth_97_lookup.get(week_of_year, 3000))
+            # Try per-product search volume first (exact date match)
+            if product_sv_lookup and week_end in product_sv_lookup:
+                D_values.append(product_sv_lookup[week_end])
+            else:
+                # Fallback to global seasonality by week_of_year
+                week_of_year = week_end.isocalendar()[1]
+                D_values.append(sv_smooth_97_lookup.get(week_of_year, 3000))
         else:
             D_values.append(3000)
     
@@ -979,9 +996,14 @@ def calculate_forecast_6_18m(
         if future_date not in extended_dates:
             extended_dates.append(future_date)
             
-            # Get values for future week
+            # Get search volume for future week
+            # Priority: per-product search volume (by exact date) > global (by week_of_year)
             week_of_year = future_date.isocalendar()[1]
-            d_val = sv_smooth_97_lookup.get(week_of_year, 3000)
+            if product_sv_lookup and future_date in product_sv_lookup:
+                d_val = product_sv_lookup[future_date]
+            else:
+                d_val = sv_smooth_97_lookup.get(week_of_year, 3000)
+            
             g_val = seasonality_idx_lookup.get(week_of_year, 1.0)
             h_val = F_constant * (1 + 0.25 * (g_val - 1))
             i_val = d_val * h_val

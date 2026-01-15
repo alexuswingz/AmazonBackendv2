@@ -1,7 +1,7 @@
 """API routes for product forecasting application."""
 from flask import Blueprint, jsonify, request
 from app import db
-from app.models import FBAInventory, AWDInventory, Product, UnitsSold, LabelInventory, VineClaims
+from app.models import FBAInventory, AWDInventory, Product, UnitsSold, LabelInventory, VineClaims, ProductSearchVolume
 from sqlalchemy import func
 
 api_bp = Blueprint('api', __name__)
@@ -306,6 +306,17 @@ def get_all_forecasts():
             'units_claimed': vc.units_claimed
         })
     
+    # Get all per-product search volume (1 query)
+    all_product_sv = ProductSearchVolume.query.all()
+    product_sv_by_asin = {}
+    for sv in all_product_sv:
+        if sv.asin not in product_sv_by_asin:
+            product_sv_by_asin[sv.asin] = []
+        product_sv_by_asin[sv.asin].append({
+            'week_date': sv.week_date,
+            'search_volume': sv.search_volume
+        })
+    
     load_time = time.time() - start_time
     
     # === CALCULATE FORECASTS IN PARALLEL ===
@@ -331,6 +342,9 @@ def get_all_forecasts():
             # Get vine claims for this ASIN
             vine_claims = vine_claims_by_asin.get(asin, [])
             
+            # Get per-product search volume for this ASIN
+            product_sv = product_sv_by_asin.get(asin, [])
+            
             # Settings - use custom settings from request params
             settings = custom_settings.copy()
             settings['total_inventory'] = total_inv
@@ -345,7 +359,7 @@ def get_all_forecasts():
             if algorithm == "18m+":
                 result = tps_18m(units_data, today, settings)
             elif algorithm == "6-18m":
-                result = tps_6_18m(units_data, seasonality_data, today, settings, vine_claims)
+                result = tps_6_18m(units_data, seasonality_data, today, settings, vine_claims, product_sv)
             else:  # 0-6m
                 result = tps_0_6m(units_data, seasonality_data, vine_claims, today, settings)
             
@@ -529,6 +543,10 @@ def get_forecast_data(asin):
     vine_claims_records = VineClaims.query.filter_by(asin=asin).all()
     vine_claims = [{'claim_date': vc.claim_date, 'units_claimed': vc.units_claimed} for vc in vine_claims_records]
     
+    # Get per-product search volume for this ASIN
+    product_sv_records = ProductSearchVolume.query.filter_by(asin=asin).all()
+    product_sv = [{'week_date': sv.week_date, 'search_volume': sv.search_volume} for sv in product_sv_records]
+    
     # Run the appropriate algorithm
     if algorithm == "18m+":
         result = tps_18m(units_data, today, settings)
@@ -545,7 +563,7 @@ def get_forecast_data(asin):
             'seasonality_index': s.seasonality_index,
             'sv_smooth_env_97': s.sv_smooth_env_97
         } for s in seasonality]
-        result = tps_6_18m(units_data, seasonality_data, today, settings, vine_claims)
+        result = tps_6_18m(units_data, seasonality_data, today, settings, vine_claims, product_sv)
         units_to_make = result['units_to_make']
         doi_total = result['doi_total_days']
         doi_fba = result['doi_fba_days']
@@ -768,6 +786,10 @@ def get_forecast_chart(asin):
     vine_records = VineClaims.query.filter_by(asin=asin).all()
     vine_claims = [{'claim_date': v.claim_date, 'units_claimed': v.units_claimed} for v in vine_records]
     
+    # Get per-product search volume
+    product_sv_records = ProductSearchVolume.query.filter_by(asin=asin).all()
+    product_sv = [{'week_date': sv.week_date, 'search_volume': sv.search_volume} for sv in product_sv_records]
+    
     # Get sales data
     sales = UnitsSold.query.filter_by(asin=asin).order_by(UnitsSold.week_date).all()
     units_data = [{'week_end': s.week_date, 'units': s.units} for s in sales]
@@ -816,7 +838,7 @@ def get_forecast_chart(asin):
         result = tps_18m(units_data, today, settings)
         velocity_adj = result.get('sales_velocity_adjustment', 0)
     elif algorithm == "6-18m":
-        result = tps_6_18m(units_data, seasonality_data, today, settings, vine_claims)
+        result = tps_6_18m(units_data, seasonality_data, today, settings, vine_claims, product_sv)
         velocity_adj = 0
     else:  # 0-6m
         result = tps_0_6m(units_data, seasonality_data, vine_claims, today, settings)
