@@ -907,18 +907,19 @@ def calculate_forecast_6_18m(
             E_values.append(0)
     
     # Column F: Average peak conversion rate (constant)
-    # F = average of E values around the peak (5-week window)
+    # Excel formula: =LET(maxVal, MAX(E:E), r, MATCH(maxVal, E:E, 0), AVERAGE(INDEX(E:E, r-2):INDEX(E:E, r+2)))
+    # CRITICAL: Excel's AVERAGE includes zeros in the calculation!
     non_zero_E = [e for e in E_values if e > 0]
     if non_zero_E:
-        max_E = max(non_zero_E)
+        max_E = max(E_values)  # Max from all E values
         max_idx = E_values.index(max_E)
-        # 5-week window around peak
+        # 5-week window around peak (Excel includes zeros!)
         start_idx = max(0, max_idx - 2)
         end_idx = min(len(E_values), max_idx + 3)
-        window = [e for e in E_values[start_idx:end_idx] if e > 0]
+        window = E_values[start_idx:end_idx]  # Include zeros like Excel
         F_constant = sum(window) / len(window) if window else max_E
     else:
-        F_constant = 0.50  # Default CVR if no data (50%)
+        F_constant = 0.0050  # Default CVR if no data (0.5%)
     
     # Column G: Get seasonality index for each week
     G_values = []
