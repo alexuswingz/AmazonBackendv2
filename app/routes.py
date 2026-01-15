@@ -196,13 +196,20 @@ def get_all_forecasts():
     """
     from app.algorithms.algorithms_tps import (
         calculate_forecast_18m_plus as tps_18m,
+        calculate_forecast_6_18m as tps_6_18m,
+        calculate_forecast_0_6m_exact as tps_0_6m,
         DEFAULT_SETTINGS
     )
+    from app.models import Seasonality
     from datetime import date
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import time
     
     start_time = time.time()
+    
+    # Load seasonality data once for 6-18m and 0-6m algorithms
+    seasonality_records = Seasonality.query.all()
+    seasonality_data = [{'week_of_year': s.week_of_year, 'seasonality_index': s.seasonality_index} for s in seasonality_records]
     
     # Query params
     brand_filter = request.args.get('brand', None)
@@ -316,8 +323,13 @@ def get_all_forecasts():
             age_months = age_days / 30.44
             algorithm = "18m+" if age_months >= 18 else ("6-18m" if age_months >= 6 else "0-6m")
             
-            # Run algorithm
-            result = tps_18m(units_data, today, settings)
+            # Run appropriate algorithm based on product age
+            if algorithm == "18m+":
+                result = tps_18m(units_data, today, settings)
+            elif algorithm == "6-18m":
+                result = tps_6_18m(units_data, seasonality_data, today, settings)
+            else:  # 0-6m
+                result = tps_0_6m(units_data, seasonality_data, today, settings)
             
             return {
                 'brand': product.brand or 'TPS Plant Foods',
