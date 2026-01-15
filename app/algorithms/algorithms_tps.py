@@ -839,13 +839,14 @@ def calculate_forecast_6_18m(
     units_data: List[Dict],
     seasonality_data: List[Dict],
     today: date = None,
-    settings: Dict = None
+    settings: Dict = None,
+    vine_claims: List[Dict] = None
 ) -> Dict:
     """
     Calculate 6-18 month forecast exactly as Excel does (forecast_6m-18m_V2 sheet).
     
     Excel formula chain:
-    C = units_sold
+    C = units_sold (adjusted for vine claims if provided)
     D = sv_smooth_env_97 (search volume from Keyword_Seasonality!I)
     E = C/D (conversion rate = sales / search volume)
     F = avg peak CVR (constant $F$3, average around max E)
@@ -859,6 +860,9 @@ def calculate_forecast_6_18m(
     
     if settings is None:
         settings = DEFAULT_SETTINGS.copy()
+    
+    if vine_claims is None:
+        vine_claims = []
     
     if not units_data:
         return {
@@ -884,9 +888,26 @@ def calculate_forecast_6_18m(
             sv_smooth_97_lookup[week_num] = sv_97
             seasonality_idx_lookup[week_num] = s.get('seasonality_index', 1.0)
     
-    # Extract week dates and units
+    # Build vine claims lookup by week
+    vine_lookup = {}
+    for vc in vine_claims:
+        claim_date = parse_date(vc.get('claim_date'))
+        if claim_date:
+            week_num = claim_date.isocalendar()[1]
+            vine_lookup[week_num] = vine_lookup.get(week_num, 0) + (vc.get('units_claimed', 0) or 0)
+    
+    # Extract week dates and units (adjusted for vine claims)
     week_dates = [parse_date(d.get('week_end')) for d in units_data]
-    units = [d.get('units', 0) or 0 for d in units_data]
+    units = []
+    for d in units_data:
+        raw_units = d.get('units', 0) or 0
+        week_end = parse_date(d.get('week_end'))
+        if week_end and vine_lookup:
+            week_of_year = week_end.isocalendar()[1]
+            vine = vine_lookup.get(week_of_year, 0)
+            units.append(max(0, raw_units - vine))
+        else:
+            units.append(raw_units)
     
     # Column D: Get sv_smooth_env_97 for each week
     D_values = []
