@@ -309,9 +309,54 @@ def seed_label_inventory():
         stats['label_inventory'] = {'rows': 0, 'time': 0}
 
 
+def seed_vine_claims():
+    """Seed Vine Claims data."""
+    print("\n[6/7] Vine Claims...")
+    
+    if table_has_data('vine_claims'):
+        print("    [SKIP] Already seeded")
+        stats['vine_claims'] = {'rows': 0, 'time': 0, 'skipped': True}
+        return
+    
+    try:
+        start = time.perf_counter()
+        df = pd.read_excel(EXCEL_PATH, sheet_name='vine_units_claimed')
+        
+        # Column mapping
+        column_map = {
+            'ASIN': 'asin',
+            'Product': 'product_name',
+            'Date': 'claim_date',
+            'Units_Claimed': 'units_claimed',
+            'Vine_Status': 'vine_status'
+        }
+        
+        df = df.rename(columns=column_map)
+        
+        # Only keep needed columns
+        data = df[['asin', 'product_name', 'claim_date', 'units_claimed', 'vine_status']].copy()
+        
+        # Clean data
+        data = data.dropna(subset=['asin', 'claim_date'])
+        data['units_claimed'] = data['units_claimed'].fillna(0).astype(int)
+        data['vine_status'] = data['vine_status'].fillna('')
+        
+        # Convert dates
+        data['claim_date'] = pd.to_datetime(data['claim_date']).dt.date
+        
+        fast_copy_insert(data, 'vine_claims', engine)
+        
+        elapsed = time.perf_counter() - start
+        stats['vine_claims'] = {'rows': len(data), 'time': elapsed}
+        print(f"    [OK] {len(data):,} rows in {elapsed:.2f}s")
+    except Exception as e:
+        print(f"    [ERROR] Failed to seed vine claims: {e}")
+        stats['vine_claims'] = {'rows': 0, 'time': 0}
+
+
 def optimize_database():
     """Run ANALYZE to optimize query planner."""
-    print("\n[6/6] Optimizing database...")
+    print("\n[7/7] Optimizing database...")
     start = time.perf_counter()
     
     with engine.connect() as conn:
@@ -343,6 +388,7 @@ if __name__ == '__main__':
     seed_units_sold()
     seed_seasonality()
     seed_label_inventory()
+    seed_vine_claims()
     
     # Optimize
     optimize_database()

@@ -276,3 +276,28 @@ class LabelInventory(db.Model):
     
     def __repr__(self):
         return f'<LabelInventory {self.asin}: {self.label_inventory} labels>'
+
+
+class VineClaims(db.Model):
+    """
+    Vine units claimed data.
+    
+    Tracks vine program claims by ASIN and date.
+    Used to adjust units sold in 0-6m and 6-18m algorithms.
+    """
+    __tablename__ = 'vine_claims'
+    
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    asin = db.Column(db.String(50), index=True, nullable=False)
+    product_name = db.Column(db.Text)
+    claim_date = db.Column(db.Date, index=True, nullable=False)
+    units_claimed = db.Column(db.Integer, default=0)
+    vine_status = db.Column(db.String(100))  # e.g., "Awaiting Reviews", "Concluded"
+    
+    __table_args__ = (
+        # Composite index for ASIN + date lookups
+        db.Index('ix_vine_claims_asin_date', 'asin', 'claim_date'),
+    )
+    
+    def __repr__(self):
+        return f'<VineClaims {self.asin} @ {self.claim_date}: {self.units_claimed}>'

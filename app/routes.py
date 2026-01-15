@@ -1,7 +1,7 @@
 """API routes for product forecasting application."""
 from flask import Blueprint, jsonify, request
 from app import db
-from app.models import FBAInventory, AWDInventory, Product, UnitsSold, LabelInventory
+from app.models import FBAInventory, AWDInventory, Product, UnitsSold, LabelInventory, VineClaims
 from sqlalchemy import func
 
 api_bp = Blueprint('api', __name__)
@@ -295,6 +295,17 @@ def get_all_forecasts():
         ).group_by(AWDInventory.asin).all()
     )
     
+    # Get all vine claims (1 query)
+    all_vine_claims = VineClaims.query.all()
+    vine_claims_by_asin = {}
+    for vc in all_vine_claims:
+        if vc.asin not in vine_claims_by_asin:
+            vine_claims_by_asin[vc.asin] = []
+        vine_claims_by_asin[vc.asin].append({
+            'claim_date': vc.claim_date,
+            'units_claimed': vc.units_claimed
+        })
+    
     load_time = time.time() - start_time
     
     # === CALCULATE FORECASTS IN PARALLEL ===
@@ -317,6 +328,9 @@ def get_all_forecasts():
             total_inv = int(fba_totals.get(asin, 0) or 0) + int(awd_totals.get(asin, 0) or 0)
             fba_avail = int(fba_available.get(asin, 0) or 0)
             
+            # Get vine claims for this ASIN
+            vine_claims = vine_claims_by_asin.get(asin, [])
+            
             # Settings - use custom settings from request params
             settings = custom_settings.copy()
             settings['total_inventory'] = total_inv
@@ -331,9 +345,9 @@ def get_all_forecasts():
             if algorithm == "18m+":
                 result = tps_18m(units_data, today, settings)
             elif algorithm == "6-18m":
-                result = tps_6_18m(units_data, seasonality_data, today, settings)
+                result = tps_6_18m(units_data, seasonality_data, today, settings, vine_claims)
             else:  # 0-6m
-                result = tps_0_6m(units_data, seasonality_data, None, today, settings)
+                result = tps_0_6m(units_data, seasonality_data, vine_claims, today, settings)
             
             return {
                 'brand': product.brand or 'TPS Plant Foods',
@@ -511,6 +525,10 @@ def get_forecast_data(asin):
         settings['manufacture_lead_time']
     )
     
+    # Get vine claims for this ASIN
+    vine_claims_records = VineClaims.query.filter_by(asin=asin).all()
+    vine_claims = [{'claim_date': vc.claim_date, 'units_claimed': vc.units_claimed} for vc in vine_claims_records]
+    
     # Run the appropriate algorithm
     if algorithm == "18m+":
         result = tps_18m(units_data, today, settings)
@@ -527,7 +545,7 @@ def get_forecast_data(asin):
             'seasonality_index': s.seasonality_index,
             'sv_smooth_env_97': s.sv_smooth_env_97
         } for s in seasonality]
-        result = tps_6_18m(units_data, seasonality_data, today, settings)
+        result = tps_6_18m(units_data, seasonality_data, today, settings, vine_claims)
         units_to_make = result['units_to_make']
         doi_total = result['doi_total_days']
         doi_fba = result['doi_fba_days']
@@ -536,7 +554,7 @@ def get_forecast_data(asin):
         from app.models import Seasonality
         seasonality = Seasonality.query.all()
         seasonality_data = [{'week_of_year': s.week_of_year, 'seasonality_index': s.seasonality_index} for s in seasonality]
-        result = tps_0_6m(units_data, seasonality_data, None, today, settings)
+        result = tps_0_6m(units_data, seasonality_data, vine_claims, today, settings)
         units_to_make = result['units_to_make']
         doi_total = result['doi_total_days']
         doi_fba = result['doi_fba_days']
