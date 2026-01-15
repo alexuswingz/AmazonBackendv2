@@ -1008,19 +1008,21 @@ def calculate_forecast_6_18m(
     
     # Column F: Get sv_smooth_env_97 for each week
     # Excel: Keyword_Seasonality auto-pulls from sv_database per ASIN, then applies smoothing
-    # Priority: per-product smoothed SV (if available), else global fallback
+    # If no per-product sv_database data, use 0 (frontend should prompt for data upload)
     D_values = []
+    has_sv_data = bool(product_sv_by_week)  # Track if product has search volume data
+    
     for d in units_data:
         week_end = parse_date(d.get('week_end'))
         if week_end:
             week_of_year = week_end.isocalendar()[1]
-            # Use per-product smoothed SV if available
-            if product_sv_by_week and week_of_year in product_sv_by_week and product_sv_by_week[week_of_year] > 0:
+            # Use per-product smoothed SV if available, else 0
+            if product_sv_by_week and week_of_year in product_sv_by_week:
                 D_values.append(product_sv_by_week[week_of_year])
             else:
-                D_values.append(sv_smooth_97_lookup.get(week_of_year, 1000))
+                D_values.append(0)  # No data = 0
         else:
-            D_values.append(1000)
+            D_values.append(0)
     
     # Column E: Conversion rate = C / D (sales / search volume)
     E_values = []
@@ -1092,18 +1094,18 @@ def calculate_forecast_6_18m(
         if future_date not in extended_dates:
             extended_dates.append(future_date)
             
-            # Get sv_smooth_env_97 for future week - per-product or global fallback
+            # Get sv_smooth_env_97 for future week - per-product only, else 0
             week_of_year = future_date.isocalendar()[1]
-            if product_sv_by_week and week_of_year in product_sv_by_week and product_sv_by_week[week_of_year] > 0:
+            if product_sv_by_week and week_of_year in product_sv_by_week:
                 d_val = product_sv_by_week[week_of_year]
             else:
-                d_val = sv_smooth_97_lookup.get(week_of_year, 1000)
+                d_val = 0  # No data = 0
             
-            # Get seasonality_index - per-product or global fallback
+            # Get seasonality_index - per-product only, else 1.0
             if product_seasonality_idx and week_of_year in product_seasonality_idx:
                 g_val = product_seasonality_idx[week_of_year]
             else:
-                g_val = seasonality_idx_lookup.get(week_of_year, 1.0)
+                g_val = 1.0  # Neutral seasonality
             
             h_val = F_constant * (1 + 0.25 * (g_val - 1))
             i_val = d_val * h_val
@@ -1149,6 +1151,7 @@ def calculate_forecast_6_18m(
         'lead_time_days': lead_time_days,
         'total_units_needed': sum(weekly_needed),
         'F_constant': F_constant,  # Peak conversion rate for debugging
+        'needs_seasonality': not has_sv_data,  # True if product needs sv_database upload
         'forecasts': [
             {
                 'week_end': d.isoformat() if d else None,

@@ -377,7 +377,8 @@ def get_all_forecasts():
                 'total_inventory': total_inv,
                 'fba_available': fba_avail,
                 'algorithm': algorithm,
-                'age_months': round(age_months, 1)
+                'age_months': round(age_months, 1),
+                'needs_seasonality': result.get('needs_seasonality', False)
             }
         except:
             return None
@@ -590,7 +591,8 @@ def get_forecast_data(asin):
             'algorithm': algorithm,
             'units_to_make': units_to_make,
             'doi_total_days': round(doi_total, 0),
-            'doi_fba_available_days': round(doi_fba, 0)
+            'doi_fba_available_days': round(doi_fba, 0),
+            'needs_seasonality': result.get('needs_seasonality', False)
         },
         'product_age': {
             'days': round(age_days, 0),
@@ -1049,6 +1051,7 @@ def get_forecast_chart(asin):
         'success': True,
         'asin': asin,
         'algorithm': algorithm,
+        'needs_seasonality': result.get('needs_seasonality', False),
         'chart_series': chart_series,
         'product': {
             'name': product.product_name,
