@@ -931,13 +931,22 @@ def calculate_forecast_6_18m(
         # F: sv_final_curve = AVERAGE(B, D, E)
         F = [(B[i] + D[i] + E[i]) / 3 for i in range(52)]
         
-        # G: sv_smooth = AVERAGE(F[i], F[i+1])
+        # G: sv_smooth = 3-row centered average of F
+        # Excel formulas show:
+        # Week 1 (row 4): AVERAGE(F4:F5) = 2 values
+        # Week 2 (row 5): AVERAGE(F4:F6) = 3 values
+        # Week 3+ (row 6+): AVERAGE(F[i-1]:F[i+1]) = 3 values centered
         G = []
         for i in range(52):
-            if i < 51:
-                G.append((F[i] + F[i+1]) / 2)
+            if i == 0:
+                # Week 1: only 2 values (no F[-1])
+                G.append((F[0] + F[1]) / 2)
+            elif i == 51:
+                # Week 52: only 2 values (no F[52])
+                G.append((F[50] + F[51]) / 2)
             else:
-                G.append(F[i])
+                # Middle weeks: 3-value centered average
+                G.append((F[i-1] + F[i] + F[i+1]) / 3)
         
         # H: sv_smooth_env = (G[i] + G[i+1]) / 2
         H = []
@@ -1007,18 +1016,21 @@ def calculate_forecast_6_18m(
             units.append(raw_units)
     
     # Column D: Get sv_smooth_env_97 for each week
-    # Excel formula: =XLOOKUP(B3, Keyword_Seasonality!A:A, Keyword_Seasonality!I:I, "")
-    # This uses GLOBAL sv_smooth_env_97 from Keyword_Seasonality, NOT per-product sv_database
-    # The per-product sv_database is only used to determine if product needs data upload
+    # Excel: Keyword_Seasonality dynamically pulls per-ASIN data from sv_database
+    # Formula: =XLOOKUP(B3, Keyword_Seasonality!A:A, Keyword_Seasonality!I:I, "")
+    # Keyword_Seasonality!I is sv_smooth_env_.97 calculated from per-product sv_database
     D_values = []
-    has_sv_data = bool(raw_sv_by_week) if 'raw_sv_by_week' in dir() else bool(product_search_volume)
+    has_sv_data = bool(product_sv_by_week)  # True if product has sv_database data
     
     for d in units_data:
         week_end = parse_date(d.get('week_end'))
         if week_end:
             week_of_year = week_end.isocalendar()[1]
-            # ALWAYS use GLOBAL sv_smooth_env_97 from Keyword_Seasonality
-            D_values.append(sv_smooth_97_lookup.get(week_of_year, 0))
+            # Use per-product smoothed SV if available, else 0 (needs data upload)
+            if product_sv_by_week and week_of_year in product_sv_by_week:
+                D_values.append(product_sv_by_week[week_of_year])
+            else:
+                D_values.append(0)
         else:
             D_values.append(0)
     
@@ -1034,11 +1046,10 @@ def calculate_forecast_6_18m(
     # This ensures the 5-week window around peak includes zeros even at data edges
     E_values_extended = E_values + [0] * 5
     
-    # Column F: Average peak conversion rate (constant)
-    # Excel formula: =LET(maxVal, MAX(E:E), r, MATCH(maxVal, E:E, 0), AVERAGE(INDEX(E:E, r-2):INDEX(E:E, r+2)))
+    # Column H: Average peak conversion rate (constant)
+    # Excel formula: =LET(maxVal, MAX(G:G), r, MATCH(maxVal, G:G, 0), AVERAGE(INDEX(G:G, r-2):INDEX(G:G, r+2)))
+    # where G = E/F = adj_units_sold / sv_smooth_env_97
     # CRITICAL: Excel's AVERAGE includes zeros in the calculation!
-    # DEFAULT: When no meaningful sales data, Excel uses 0.12% (0.0012) as default
-    DEFAULT_CVR = 0.0012  # 0.12% - Excel's default when no sales
     
     non_zero_E = [e for e in E_values_extended if e > 0]
     if non_zero_E:
@@ -1049,22 +1060,23 @@ def calculate_forecast_6_18m(
         end_idx = min(len(E_values_extended), max_idx + 3)
         window = E_values_extended[start_idx:end_idx]  # Include zeros like Excel
         F_constant = sum(window) / len(window) if window else max_E
-        # Use default if calculated value is too low (product has minimal sales)
-        if F_constant < DEFAULT_CVR:
-            F_constant = DEFAULT_CVR
     else:
-        F_constant = DEFAULT_CVR  # Default CVR if no data (0.12%)
+        # No sales data - use 0, forecast will be 0
+        F_constant = 0
     
     # Column G: Get seasonality index for each week
-    # Excel formula: =XLOOKUP(B4, Keyword_Seasonality!A:A, Keyword_Seasonality!J:J, "")
-    # This uses GLOBAL seasonality_index from Keyword_Seasonality
+    # Excel: Keyword_Seasonality!J is seasonality_index = H / MAX(H) - per product
+    # Formula: =XLOOKUP(B4, Keyword_Seasonality!A:A, Keyword_Seasonality!J:J, "")
     G_values = []
     for d in units_data:
         week_end = parse_date(d.get('week_end'))
         if week_end:
             week_of_year = week_end.isocalendar()[1]
-            # ALWAYS use GLOBAL seasonality_index from Keyword_Seasonality
-            G_values.append(seasonality_idx_lookup.get(week_of_year, 1.0))
+            # Use per-product seasonality_index if available
+            if product_seasonality_idx and week_of_year in product_seasonality_idx:
+                G_values.append(product_seasonality_idx[week_of_year])
+            else:
+                G_values.append(1.0)  # Neutral if no data
         else:
             G_values.append(1.0)
     
@@ -1089,12 +1101,18 @@ def calculate_forecast_6_18m(
         if future_date not in extended_dates:
             extended_dates.append(future_date)
             
-            # Get GLOBAL sv_smooth_env_97 for future week
+            # Get per-product sv_smooth_env_97 for future week (cyclical by week_of_year)
             week_of_year = future_date.isocalendar()[1]
-            d_val = sv_smooth_97_lookup.get(week_of_year, 0)
+            if product_sv_by_week and week_of_year in product_sv_by_week:
+                d_val = product_sv_by_week[week_of_year]
+            else:
+                d_val = 0  # No data
             
-            # Get GLOBAL seasonality_index for future week
-            g_val = seasonality_idx_lookup.get(week_of_year, 1.0)
+            # Get per-product seasonality_index for future week
+            if product_seasonality_idx and week_of_year in product_seasonality_idx:
+                g_val = product_seasonality_idx[week_of_year]
+            else:
+                g_val = 1.0  # Neutral
             
             h_val = F_constant * (1 + 0.25 * (g_val - 1))
             i_val = d_val * h_val
