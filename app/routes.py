@@ -207,9 +207,13 @@ def get_all_forecasts():
     
     start_time = time.time()
     
-    # Load seasonality data once for 6-18m and 0-6m algorithms
+    # Load seasonality data once for 6-18m and 0-6m algorithms (include sv_smooth_env_97)
     seasonality_records = Seasonality.query.all()
-    seasonality_data = [{'week_of_year': s.week_of_year, 'seasonality_index': s.seasonality_index} for s in seasonality_records]
+    seasonality_data = [{
+        'week_of_year': s.week_of_year, 
+        'seasonality_index': s.seasonality_index,
+        'sv_smooth_env_97': s.sv_smooth_env_97
+    } for s in seasonality_records]
     
     # Query params
     brand_filter = request.args.get('brand', None)
@@ -515,11 +519,15 @@ def get_forecast_data(asin):
         doi_fba = result['doi_fba_days']
         velocity_adj = result.get('sales_velocity_adjustment', 0)
     elif algorithm == "6-18m":
-        # Get seasonality data from database
+        # Get seasonality data from database (include sv_smooth_env_97 for forecast calculation)
         from app.models import Seasonality
         seasonality = Seasonality.query.all()
-        seasonality_data = [{'week_of_year': s.week_of_year, 'seasonality_index': s.seasonality_index} for s in seasonality]
-        result = tps_6_18m(units_data, today, settings, seasonality_data)
+        seasonality_data = [{
+            'week_of_year': s.week_of_year, 
+            'seasonality_index': s.seasonality_index,
+            'sv_smooth_env_97': s.sv_smooth_env_97
+        } for s in seasonality]
+        result = tps_6_18m(units_data, seasonality_data, today, settings)
         units_to_make = result['units_to_make']
         doi_total = result['doi_total_days']
         doi_fba = result['doi_fba_days']
@@ -528,7 +536,7 @@ def get_forecast_data(asin):
         from app.models import Seasonality
         seasonality = Seasonality.query.all()
         seasonality_data = [{'week_of_year': s.week_of_year, 'seasonality_index': s.seasonality_index} for s in seasonality]
-        result = tps_0_6m(units_data, today, settings, seasonality_data)
+        result = tps_0_6m(units_data, seasonality_data, None, today, settings)
         units_to_make = result['units_to_make']
         doi_total = result['doi_total_days']
         doi_fba = result['doi_fba_days']
