@@ -888,13 +888,14 @@ def calculate_forecast_6_18m(
             sv_smooth_97_lookup[week_num] = sv_97
             seasonality_idx_lookup[week_num] = s.get('seasonality_index', 1.0)
     
-    # Build vine claims lookup by week
+    # Build vine claims lookup by (year, week) to avoid cross-year collisions
     vine_lookup = {}
     for vc in vine_claims:
         claim_date = parse_date(vc.get('claim_date'))
         if claim_date:
-            week_num = claim_date.isocalendar()[1]
-            vine_lookup[week_num] = vine_lookup.get(week_num, 0) + (vc.get('units_claimed', 0) or 0)
+            iso_cal = claim_date.isocalendar()
+            key = (iso_cal[0], iso_cal[1])  # (year, week_number)
+            vine_lookup[key] = vine_lookup.get(key, 0) + (vc.get('units_claimed', 0) or 0)
     
     # Extract week dates and units (adjusted for vine claims)
     week_dates = [parse_date(d.get('week_end')) for d in units_data]
@@ -903,8 +904,9 @@ def calculate_forecast_6_18m(
         raw_units = d.get('units', 0) or 0
         week_end = parse_date(d.get('week_end'))
         if week_end and vine_lookup:
-            week_of_year = week_end.isocalendar()[1]
-            vine = vine_lookup.get(week_of_year, 0)
+            iso_cal = week_end.isocalendar()
+            key = (iso_cal[0], iso_cal[1])  # (year, week_number)
+            vine = vine_lookup.get(key, 0)
             units.append(max(0, raw_units - vine))
         else:
             units.append(raw_units)
@@ -1087,14 +1089,14 @@ def calculate_forecast_0_6m_exact(
         if week_num:
             seasonality_idx_lookup[week_num] = s.get('seasonality_index', 1.0)
     
-    # Build vine claims lookup by week
+    # Build vine claims lookup by (year, week) to avoid cross-year collisions
     vine_lookup = {}
     for vc in vine_claims:
         claim_date = parse_date(vc.get('claim_date'))
         if claim_date:
-            # Group by week ending
-            week_num = claim_date.isocalendar()[1]
-            vine_lookup[week_num] = vine_lookup.get(week_num, 0) + (vc.get('units_claimed', 0) or 0)
+            iso_cal = claim_date.isocalendar()
+            key = (iso_cal[0], iso_cal[1])  # (year, week_number)
+            vine_lookup[key] = vine_lookup.get(key, 0) + (vc.get('units_claimed', 0) or 0)
     
     # Extract week dates and units
     week_dates = [parse_date(d.get('week_end')) for d in units_data]
@@ -1105,8 +1107,9 @@ def calculate_forecast_0_6m_exact(
     for i, d in enumerate(units_data):
         week_end = parse_date(d.get('week_end'))
         if week_end:
-            week_of_year = week_end.isocalendar()[1]
-            vine = vine_lookup.get(week_of_year, 0)
+            iso_cal = week_end.isocalendar()
+            key = (iso_cal[0], iso_cal[1])  # (year, week_number)
+            vine = vine_lookup.get(key, 0)
             adjusted = max(0, units[i] - vine)
             E_values.append(adjusted)
         else:
