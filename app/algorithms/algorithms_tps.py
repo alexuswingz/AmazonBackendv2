@@ -877,12 +877,19 @@ def calculate_forecast_6_18m(
             'settings': settings
         }
     
-    # Build per-product search volume lookup by week_date (primary source for Column D)
-    product_sv_lookup = {}  # week_date → search_volume
+    # Build per-product search volume lookups (primary source for Column D)
+    # 1. By exact date (for historical data)
+    product_sv_by_date = {}  # week_date → search_volume
+    # 2. By week_of_year (for future dates - cyclical)
+    product_sv_by_week = {}  # week_of_year → search_volume
     for sv in product_search_volume:
         week_date = parse_date(sv.get('week_date'))
         if week_date:
-            product_sv_lookup[week_date] = sv.get('search_volume', 0) or 0
+            sv_val = sv.get('search_volume', 0) or 0
+            product_sv_by_date[week_date] = sv_val
+            # Also store by week_of_year for cyclical future lookups
+            week_of_year = week_date.isocalendar()[1]
+            product_sv_by_week[week_of_year] = sv_val
     
     # Build GLOBAL seasonality lookups by week number (fallback for D, primary for G)
     # D = sv_smooth_env_97 (search volume), G = seasonality_index
@@ -923,17 +930,20 @@ def calculate_forecast_6_18m(
             units.append(raw_units)
     
     # Column D: Get search volume for each week
-    # Priority: per-product search volume (by exact date) > global sv_smooth_env_97 (by week_of_year)
+    # Priority: 1) per-product by exact date, 2) per-product by week_of_year, 3) global seasonality
     D_values = []
     for d in units_data:
         week_end = parse_date(d.get('week_end'))
         if week_end:
+            week_of_year = week_end.isocalendar()[1]
             # Try per-product search volume first (exact date match)
-            if product_sv_lookup and week_end in product_sv_lookup:
-                D_values.append(product_sv_lookup[week_end])
+            if product_sv_by_date and week_end in product_sv_by_date:
+                D_values.append(product_sv_by_date[week_end])
+            # Then try per-product by week_of_year (cyclical)
+            elif product_sv_by_week and week_of_year in product_sv_by_week:
+                D_values.append(product_sv_by_week[week_of_year])
             else:
                 # Fallback to global seasonality by week_of_year
-                week_of_year = week_end.isocalendar()[1]
                 D_values.append(sv_smooth_97_lookup.get(week_of_year, 3000))
         else:
             D_values.append(3000)
@@ -997,10 +1007,12 @@ def calculate_forecast_6_18m(
             extended_dates.append(future_date)
             
             # Get search volume for future week
-            # Priority: per-product search volume (by exact date) > global (by week_of_year)
+            # Priority: 1) per-product by exact date, 2) per-product by week_of_year (cyclical), 3) global
             week_of_year = future_date.isocalendar()[1]
-            if product_sv_lookup and future_date in product_sv_lookup:
-                d_val = product_sv_lookup[future_date]
+            if product_sv_by_date and future_date in product_sv_by_date:
+                d_val = product_sv_by_date[future_date]
+            elif product_sv_by_week and week_of_year in product_sv_by_week:
+                d_val = product_sv_by_week[week_of_year]  # Cyclical: use same week from previous year
             else:
                 d_val = sv_smooth_97_lookup.get(week_of_year, 3000)
             
