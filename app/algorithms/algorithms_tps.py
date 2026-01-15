@@ -948,14 +948,30 @@ def calculate_forecast_6_18m(
                 H.append(G[i])
         
         # I: sv_smooth_env_.97 = H * 0.97
-        for i in range(52):
-            week = i + 1
-            product_sv_by_week[week] = H[i] * 0.97
+        # J: seasonality_index = H / MAX(H) - normalized to peak
+        max_H = max(H) if H else 0
+        
+        # Only use per-product data if it has meaningful values (max_H > 0)
+        if max_H > 0:
+            for i in range(52):
+                week = i + 1
+                product_sv_by_week[week] = H[i] * 0.97
+            
+            # Store per-product seasonality_index (H / MAX(H))
+            product_seasonality_idx = {}
+            for i in range(52):
+                week = i + 1
+                product_seasonality_idx[week] = H[i] / max_H
+        else:
+            # Per-product data is all zeros, clear it to use global fallback
+            product_sv_by_week = {}
+            product_seasonality_idx = {}
+    else:
+        product_seasonality_idx = {}
     
-    # Build GLOBAL seasonality lookups by week number (fallback for D, primary for G)
-    # D = sv_smooth_env_97 (search volume), G = seasonality_index
-    sv_smooth_97_lookup = {}  # Column D fallback (sv_smooth_env_97)
-    seasonality_idx_lookup = {}  # Column G (seasonality_index)
+    # Build GLOBAL seasonality lookups by week number (fallback when no per-product data)
+    sv_smooth_97_lookup = {}  # Column F fallback (sv_smooth_env_97)
+    seasonality_idx_lookup = {}  # Column I fallback (seasonality_index)
     
     for s in seasonality_data:
         week_num = s.get('week_of_year', s.get('week_number', 0))
@@ -990,18 +1006,21 @@ def calculate_forecast_6_18m(
         else:
             units.append(raw_units)
     
-    # Column D: Get search volume for each week
-    # Excel formula: =XLOOKUP(B3, Keyword_Seasonality!A:A, Keyword_Seasonality!I:I, "")
-    # This ALWAYS uses GLOBAL sv_smooth_env_97 from Keyword_Seasonality sheet (not per-product)
+    # Column F: Get sv_smooth_env_97 for each week
+    # Excel: Keyword_Seasonality auto-pulls from sv_database per ASIN, then applies smoothing
+    # Priority: per-product smoothed SV (if available), else global fallback
     D_values = []
     for d in units_data:
         week_end = parse_date(d.get('week_end'))
         if week_end:
             week_of_year = week_end.isocalendar()[1]
-            # Always use global sv_smooth_env_97 (Column I from Keyword_Seasonality)
-            D_values.append(sv_smooth_97_lookup.get(week_of_year, 3000))
+            # Use per-product smoothed SV if available
+            if product_sv_by_week and week_of_year in product_sv_by_week and product_sv_by_week[week_of_year] > 0:
+                D_values.append(product_sv_by_week[week_of_year])
+            else:
+                D_values.append(sv_smooth_97_lookup.get(week_of_year, 1000))
         else:
-            D_values.append(3000)
+            D_values.append(1000)
     
     # Column E: Conversion rate = C / D (sales / search volume)
     E_values = []
@@ -1037,12 +1056,18 @@ def calculate_forecast_6_18m(
         F_constant = DEFAULT_CVR  # Default CVR if no data (0.12%)
     
     # Column G: Get seasonality index for each week
+    # Column I: Get seasonality_index for each week
+    # Excel: seasonality_index = H / MAX(H) - per-product from Keyword_Seasonality
     G_values = []
     for d in units_data:
         week_end = parse_date(d.get('week_end'))
         if week_end:
             week_of_year = week_end.isocalendar()[1]
-            G_values.append(seasonality_idx_lookup.get(week_of_year, 1.0))
+            # Use per-product seasonality_index if available
+            if product_seasonality_idx and week_of_year in product_seasonality_idx:
+                G_values.append(product_seasonality_idx[week_of_year])
+            else:
+                G_values.append(seasonality_idx_lookup.get(week_of_year, 1.0))
         else:
             G_values.append(1.0)
     
@@ -1067,12 +1092,19 @@ def calculate_forecast_6_18m(
         if future_date not in extended_dates:
             extended_dates.append(future_date)
             
-            # Get search volume for future week
-            # Excel always uses GLOBAL sv_smooth_env_97 from Keyword_Seasonality
+            # Get sv_smooth_env_97 for future week - per-product or global fallback
             week_of_year = future_date.isocalendar()[1]
-            d_val = sv_smooth_97_lookup.get(week_of_year, 3000)
+            if product_sv_by_week and week_of_year in product_sv_by_week and product_sv_by_week[week_of_year] > 0:
+                d_val = product_sv_by_week[week_of_year]
+            else:
+                d_val = sv_smooth_97_lookup.get(week_of_year, 1000)
             
-            g_val = seasonality_idx_lookup.get(week_of_year, 1.0)
+            # Get seasonality_index - per-product or global fallback
+            if product_seasonality_idx and week_of_year in product_seasonality_idx:
+                g_val = product_seasonality_idx[week_of_year]
+            else:
+                g_val = seasonality_idx_lookup.get(week_of_year, 1.0)
+            
             h_val = F_constant * (1 + 0.25 * (g_val - 1))
             i_val = d_val * h_val
             extended_forecasts.append(i_val)
