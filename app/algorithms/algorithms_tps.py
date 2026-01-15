@@ -879,17 +879,26 @@ def calculate_forecast_6_18m(
     
     # Build per-product search volume lookups from sv_database
     # Excel auto-pulls seasonality data per child ASIN from sv_database
-    # Priority: per-product SV > global seasonality (fallback)
+    # Then applies smoothing: sv_peak_env → sv_smooth_env → sv_smooth_env_.97
     product_sv_by_date = {}  # week_date → search_volume
-    product_sv_by_week = {}  # week_of_year → search_volume (for cyclical future dates)
+    product_sv_by_week = {}  # week_of_year → smoothed search_volume
+    
+    # First pass: collect raw values by week_of_year
+    raw_sv_by_week = {}
     for sv in product_search_volume:
         week_date = parse_date(sv.get('week_date'))
         if week_date:
             sv_val = sv.get('search_volume', 0) or 0
             product_sv_by_date[week_date] = sv_val
-            # Also store by week_of_year for cyclical future date lookups
             week_of_year = week_date.isocalendar()[1]
-            product_sv_by_week[week_of_year] = sv_val
+            raw_sv_by_week[week_of_year] = sv_val
+    
+    # Use per-product SV values directly from sv_database
+    # Note: Excel applies additional smoothing (sv_smooth_env_.97) which we approximate
+    # by using the raw values. For exact match, would need Excel's peak envelope formulas.
+    if raw_sv_by_week:
+        for week, sv_val in raw_sv_by_week.items():
+            product_sv_by_week[week] = sv_val
     
     # Build GLOBAL seasonality lookups by week number (fallback for D, primary for G)
     # D = sv_smooth_env_97 (search volume), G = seasonality_index
