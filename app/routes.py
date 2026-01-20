@@ -587,7 +587,7 @@ def get_forecast_data(asin):
         from app.models import Seasonality
         seasonality = Seasonality.query.all()
         seasonality_data = [{'week_of_year': s.week_of_year, 'seasonality_index': s.seasonality_index} for s in seasonality]
-        result = tps_0_6m(units_data, seasonality_data, vine_claims, today, settings)
+        result = tps_0_6m(units_data, seasonality_data, vine_claims, today, settings, product_sv)  # Include product_sv!
         units_to_make = result['units_to_make']
         doi_total = result['doi_total_days']
         doi_fba = result['doi_fba_days']
