@@ -9,20 +9,22 @@ from datetime import datetime, date, timedelta
 from sqlalchemy import create_engine, text
 import time
 
-EXCEL_PATH = r'C:\Users\User\OneDrive\Desktop\NewData\V2.2 AutoForecast 1000 Bananas 2026.1.7 (8).xlsx'
+EXCEL_PATH = r'C:\Users\User\OneDrive\Desktop\NewData\V2.2 AutoForecast 1000 Bananas 2026.1.7 (9).xlsx'
 POSTGRES_URL = 'postgresql://postgres:JMVZWnrhWpFToCzqgkEwCPhSBHCvUMuH@caboose.proxy.rlwy.net:54152/railway'
 
 engine = create_engine(POSTGRES_URL)
 
 def sync_fba_inventory():
-    """Sync FBA Inventory"""
+    """Sync FBA Inventory with inbound and reserved quantities"""
     print("  Syncing FBA Inventory...", end=" ", flush=True)
     
     fba_df = pd.read_excel(EXCEL_PATH, sheet_name='FBAInventory')
     
     fba_df = fba_df.rename(columns={
         'snapshot-date': 'snapshot_date',
-        'product-name': 'product_name'
+        'product-name': 'product_name',
+        'inbound-quantity': 'inbound_quantity',
+        'Total Reserved Quantity': 'total_reserved_quantity'
     })
     
     # Filter out header rows and rows without valid ASIN
@@ -30,18 +32,27 @@ def sync_fba_inventory():
     fba_df = fba_df[~fba_df['asin'].astype(str).str.contains('asin', case=False, na=False)]
     fba_df['asin'] = fba_df['asin'].astype(str)
     
-    # Keep essential columns only
-    fba_df = fba_df[['snapshot_date', 'sku', 'fnsku', 'asin', 'product_name', 'condition', 'available']]
+    # Keep essential columns including inbound and reserved
+    fba_df = fba_df[['snapshot_date', 'sku', 'fnsku', 'asin', 'product_name', 'condition', 
+                     'available', 'inbound_quantity', 'total_reserved_quantity']]
     
-    # Convert available to numeric
+    # Convert to numeric
     fba_df['available'] = pd.to_numeric(fba_df['available'], errors='coerce').fillna(0).astype(int)
+    fba_df['inbound_quantity'] = pd.to_numeric(fba_df['inbound_quantity'], errors='coerce').fillna(0).astype(int)
+    fba_df['total_reserved_quantity'] = pd.to_numeric(fba_df['total_reserved_quantity'], errors='coerce').fillna(0).astype(int)
     
     with engine.begin() as conn:
         conn.execute(text("TRUNCATE TABLE fba_inventory"))
     
     fba_df.to_sql('fba_inventory', engine, if_exists='append', index=False, method='multi', chunksize=200)
     
-    print(f"{len(fba_df)} rows")
+    # Show sample totals
+    sample_asin = 'B0C73T7GD6'
+    sample = fba_df[fba_df['asin'] == sample_asin]
+    if not sample.empty:
+        print(f"{len(fba_df)} rows | Sample {sample_asin}: avail={sample['available'].sum()}, inbound={sample['inbound_quantity'].sum()}, reserved={sample['total_reserved_quantity'].sum()}")
+    else:
+        print(f"{len(fba_df)} rows")
     return len(fba_df)
 
 def sync_awd_inventory():

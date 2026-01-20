@@ -61,6 +61,8 @@ class ForecastService:
         
         Aggregates across all SKUs for the same ASIN (important for products
         with multiple SKU variations).
+        
+        Updated: 2026-01-21 - Added inbound and reserved quantities
         """
         from sqlalchemy import func
         

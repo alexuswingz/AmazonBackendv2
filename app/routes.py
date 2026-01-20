@@ -601,7 +601,17 @@ def get_forecast_data(asin):
             'size': product.size
         },
         'total_inventory': total_inventory,
+        'fba_available': fba_available,
         'label_inventory': label_inventory,
+        'inventory': {
+            'total_inventory': total_inventory,
+            'fba_available': fba_available,
+            'fba_inbound': inventory.fba_inbound,
+            'fba_reserved': inventory.fba_reserved,
+            'awd_available': inventory.awd_available,
+            'awd_inbound': inventory.awd_inbound,
+            'awd_reserved': inventory.awd_reserved,
+        },
         'production_forecast': {
             'algorithm': algorithm,
             'units_to_make': units_to_make,
