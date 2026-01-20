@@ -317,6 +317,15 @@ def get_all_forecasts():
             'search_volume': sv.search_volume
         })
     
+    # Get all label inventory (1 query)
+    label_inv_by_asin = {}
+    try:
+        all_label_inv = LabelInventory.query.all()
+        for li in all_label_inv:
+            label_inv_by_asin[li.asin] = li.label_inventory or 0
+    except Exception as e:
+        print(f"Warning: Could not load label inventory: {e}")
+    
     load_time = time.time() - start_time
     
     # === CALCULATE FORECASTS IN PARALLEL ===
@@ -376,6 +385,7 @@ def get_all_forecasts():
                 'doi_fba': round(result['doi_fba_days'], 0),  # Alias
                 'total_inventory': total_inv,
                 'fba_available': fba_avail,
+                'label_inventory': label_inv_by_asin.get(asin, 0),  # Label inventory
                 'algorithm': algorithm,
                 'age_months': round(age_months, 1),
                 'needs_seasonality': result.get('needs_seasonality', False)
@@ -515,6 +525,10 @@ def get_forecast_data(asin):
     total_inventory = inventory.total_inventory
     fba_available = inventory.fba_available
     
+    # Get label inventory
+    label_record = LabelInventory.query.filter_by(asin=asin).first()
+    label_inventory = label_record.label_inventory if label_record else 0
+    
     # Get custom DOI settings from query parameters (or use defaults)
     custom_amazon_doi_goal = request.args.get('amazon_doi_goal', type=int)
     custom_inbound_lead_time = request.args.get('inbound_lead_time', type=int)
@@ -587,6 +601,7 @@ def get_forecast_data(asin):
             'size': product.size
         },
         'total_inventory': total_inventory,
+        'label_inventory': label_inventory,
         'production_forecast': {
             'algorithm': algorithm,
             'units_to_make': units_to_make,
