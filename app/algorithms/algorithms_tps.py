@@ -1237,13 +1237,16 @@ def calculate_forecast_0_6m_exact(
     EXACT Excel formula chain (forecast_0m-6m sheet):
     E = adj_units_sold = MAX(0, units_sold - vine_units)
     F$3 = peak_units = MAX(E:E)  -- Maximum adjusted sales across all weeks
-    G = seasonality_index (per-product from sv_database smoothing chain)
+    G = seasonality_index (per-product from sv_database, OR global if unavailable)
     idxNow = seasonality_index for the most recent historical week
     
     H (forecast) = peak_units × (G / idxNow)^0.65
     
     U = weekly_units_needed (overlap fraction calculation)
     W = Units to Make = MAX(0, SUM(U) - Inventory)
+    
+    Key insight: The formula projects peak sales from winter (low seasonality ~0.09)
+    to summer (high seasonality ~1.0), causing forecasts to be 5+ times higher.
     """
     if today is None:
         today = date.today()
@@ -1269,18 +1272,29 @@ def calculate_forecast_0_6m_exact(
             })
     
     # =========================================================================
-    # SEASONALITY: Per-product from sv_database via Keyword_Seasonality smoothing
-    # Excel: Keyword_Seasonality pulls sv_database filtered by ASIN, then calculates
-    # seasonality_index via smoothing chain. G3 XLOOKUPs that per-product result.
+    # SEASONALITY: Try per-product first, then fallback to GLOBAL seasonality
+    # Excel: Keyword_Seasonality pulls sv_database filtered by ASIN
+    # If no per-product data, uses GLOBAL seasonality (same for all products)
     # =========================================================================
     seasonality_idx_lookup = {}
+    has_sv_data = False
     
+    # First try per-product seasonality from sv_database
     if product_search_volume:
-        # Calculate per-product seasonality from sv_database using smoothing chain
         seasonality_idx_lookup = calculate_per_product_seasonality(product_search_volume)
+        if seasonality_idx_lookup:
+            has_sv_data = True
     
-    # If no per-product SV data, product needs sv_database upload
-    has_sv_data = bool(seasonality_idx_lookup)
+    # FALLBACK: Use global seasonality from seasonality_data table
+    # This is critical for new products without sv_database entries
+    if not has_sv_data and seasonality_data:
+        for s in seasonality_data:
+            week_num = s.get('week_of_year')
+            seasonality_idx = s.get('seasonality_index')
+            if week_num is not None and seasonality_idx is not None:
+                seasonality_idx_lookup[week_num] = round(float(seasonality_idx), 2)
+        if seasonality_idx_lookup:
+            has_sv_data = True  # Using global seasonality
     
     # =========================================================================
     # STEP 1: Calculate adj_units_sold (E) and find peak_units (F$3)
@@ -1323,11 +1337,16 @@ def calculate_forecast_0_6m_exact(
     peak_units = max(adj_units_list) if adj_units_list else 0
     
     # idxNow = seasonality_index for the current/most recent historical week
+    # This is critical: winter idxNow (~0.09) vs summer future (~1.0) = big multiplier!
     if last_historical_week:
-        idx_now = seasonality_idx_lookup.get(last_historical_week, 1.0)
+        idx_now = seasonality_idx_lookup.get(last_historical_week, 0.15)  # Default to low if missing
     else:
         # Fallback to current week's seasonality
-        idx_now = seasonality_idx_lookup.get(today.isocalendar()[1], 1.0)
+        idx_now = seasonality_idx_lookup.get(today.isocalendar()[1], 0.15)
+    
+    # Ensure idx_now is not zero (avoid division by zero)
+    if idx_now <= 0:
+        idx_now = 0.15  # Default to winter-like low value
     
     # =========================================================================
     # STEP 2: Calculate lead time
@@ -1343,6 +1362,10 @@ def calculate_forecast_0_6m_exact(
     # H = peak_units × (G / idxNow)^0.65
     # where G = future week's seasonality_index
     # Google Sheets uses Saturday week-ends, so we align to Saturdays
+    #
+    # Key formula insight:
+    # - If peak_units=5 was achieved in winter (idxNow=0.09)
+    # - Summer forecast = 5 × (1.0/0.09)^0.65 = 5 × 5.17 = 25.85 units/week
     # =========================================================================
     ELASTICITY = 0.65  # From Excel formula
     
@@ -1362,11 +1385,13 @@ def calculate_forecast_0_6m_exact(
         week_of_year = current_date.isocalendar()[1]
         
         # G = seasonality_index for this future week
-        future_seasonality = seasonality_idx_lookup.get(week_of_year, 1.0)
+        future_seasonality = seasonality_idx_lookup.get(week_of_year, 0.5)  # Default to mid-range
         
         # H = MAX(0, peak_units × POWER(G / idxNow, 0.65))
         if idx_now > 0 and peak_units > 0:
-            forecast = max(0, peak_units * pow(future_seasonality / idx_now, ELASTICITY))
+            # This is the key formula that projects winter sales to summer
+            ratio = future_seasonality / idx_now
+            forecast = max(0, peak_units * pow(ratio, ELASTICITY))
         else:
             forecast = 0
         
@@ -1377,6 +1402,7 @@ def calculate_forecast_0_6m_exact(
     
     # =========================================================================
     # STEP 4: Calculate weekly units needed (overlap fraction)
+    # Excel formula: H × MAX(0, MIN(lead_time_end, week_end) - MAX(today, week_start)) / 7
     # =========================================================================
     weekly_needed = calculate_weekly_units_needed(
         extended_forecasts, extended_dates, today, lead_time_days
@@ -1402,8 +1428,9 @@ def calculate_forecast_0_6m_exact(
         'lead_time_days': lead_time_days,
         'total_units_needed': sum(weekly_needed),
         'peak_units': peak_units,  # F$3 value
-        'idx_now': idx_now,  # Current seasonality
+        'idx_now': idx_now,  # Current seasonality (should be ~0.09 in winter)
         'elasticity': ELASTICITY,
+        'needs_seasonality': not has_sv_data,
         'forecasts': [
             {
                 'week_end': d.isoformat() if d else None,

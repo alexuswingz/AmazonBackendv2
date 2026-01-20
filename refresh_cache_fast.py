@@ -7,7 +7,7 @@ from sqlalchemy import create_engine, text
 from io import StringIO
 import time
 
-POSTGRES_URL = 'postgresql://postgres:JMVZWnrhWpFToCzqgkEwCPhSBHCvUMuH@caboose.proxy.rlwy.net:54152/railway'
+POSTGRES_URL = 'postgresql://postgres:YyeRMrVpRBITQyZuAPAihQihqCiazuHJ@maglev.proxy.rlwy.net:27064/railway'
 engine = create_engine(POSTGRES_URL)
 
 from app.algorithms.algorithms_tps import (
