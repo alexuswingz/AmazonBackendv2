@@ -265,14 +265,13 @@ class LabelInventory(db.Model):
     """
     __tablename__ = 'label_inventory'
     
-    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    asin = db.Column(db.String(50), unique=True, nullable=False)
+    # ASIN is the primary key (matches database schema)
+    asin = db.Column(db.Text, primary_key=True)
     product_name = db.Column(db.Text)
-    size = db.Column(db.String(50))
-    label_id = db.Column(db.String(50))  # e.g., LBL-PLANT-494
-    label_status = db.Column(db.String(50))  # e.g., "Up to Date"
+    size = db.Column(db.Text)
+    label_id = db.Column(db.Text)  # e.g., LBL-PLANT-494
+    label_status = db.Column(db.Text)  # e.g., "Up to Date"
     label_inventory = db.Column(db.Integer, default=0)  # Labels in stock
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
     
     def __repr__(self):
         return f'<LabelInventory {self.asin}: {self.label_inventory} labels>'
