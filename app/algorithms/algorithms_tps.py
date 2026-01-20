@@ -833,6 +833,7 @@ def calculate_forecast_18m_plus(
 
 # =============================================================================
 # 6-18 MONTH FORECAST ALGORITHM (forecast_6m-18m_V2 sheet)
+# EXACT EXCEL FORMULA REPLICATION
 # =============================================================================
 
 def calculate_forecast_6_18m(
@@ -846,15 +847,18 @@ def calculate_forecast_6_18m(
     """
     Calculate 6-18 month forecast exactly as Excel does (forecast_6m-18m_V2 sheet).
     
-    Excel formula chain:
-    C = units_sold (adjusted for vine claims if provided)
-    D = sv_smooth_env_97 (search volume - per-product from sv_database, or global fallback)
-    E = C/D (conversion rate = sales / search volume)
-    F = avg peak CVR (constant $F$3, average around max E)
-    G = seasonality_index (from Keyword_Seasonality!J - global)
-    H = F × (1 + 0.25 × (G - 1)) (25% weighted CVR)
-    I = D × H (forecast = search volume × adjusted CVR)
-    J = I for future weeks (forecast column)
+    EXACT Excel formula chain:
+    E = adj_units_sold = MAX(0, units - vine_units)
+    F = sv_smooth_env_97 (from Keyword_Seasonality!I via XLOOKUP)
+    G = Sales/SV = E/F
+    H = avg peak CVR = LET(maxVal, MAX(G:G), r, MATCH(maxVal, G:G, 0), AVERAGE(G[r-2:r+2]))
+    I = seasonality_index (from Keyword_Seasonality!J via XLOOKUP)
+    J = 25% weighted CVR = H$3 * (1 + 0.25 * (I - 1))
+    L = forecast = IF(A > TODAY(), K, "")  where K = units_sold_potential
+    Y = weekly_units_needed (overlap calculation)
+    AA = Units to Make = MAX(0, Z - Inventory)
+    
+    Key insight: H is calculated once (avg of peak G values), then J adjusts by seasonality!
     """
     if today is None:
         today = date.today()
@@ -868,286 +872,224 @@ def calculate_forecast_6_18m(
     if product_search_volume is None:
         product_search_volume = []
     
-    if not units_data:
+    if not units_data and not product_search_volume and not seasonality_data:
         return {
             'units_to_make': 0,
             'doi_total_days': 0,
             'doi_fba_days': 0,
             'forecasts': [],
-            'settings': settings
+            'settings': settings,
+            'needs_seasonality': True
         }
     
-    # Build per-product search volume lookups from sv_database
-    # Excel auto-pulls seasonality data per child ASIN from sv_database
-    # Then applies smoothing: sv_peak_env → sv_smooth_env → sv_smooth_env_.97
-    product_sv_by_date = {}  # week_date → search_volume
-    product_sv_by_week = {}  # week_of_year → smoothed search_volume
-    
-    # First pass: collect raw values by week_of_year
-    raw_sv_by_week = {}
-    for sv in product_search_volume:
-        week_date = parse_date(sv.get('week_date'))
-        if week_date:
-            sv_val = sv.get('search_volume', 0) or 0
-            product_sv_by_date[week_date] = sv_val
-            week_of_year = week_date.isocalendar()[1]
-            raw_sv_by_week[week_of_year] = sv_val
-    
-    # Apply Excel's smoothing formula chain to get sv_smooth_env_.97
-    # B = raw search_volume from sv_database
-    # C = sv_peak_env = MAX(OFFSET(B,-2,0,3)) - max of 3 cells ending at current
-    # D = sv_peak_env_offset = (C[i] + C[i+1]) / 2
-    # E = sv_smooth_env = AVERAGE(OFFSET(D,-1,0,3)) - 3-row centered average
-    # F = sv_final_curve = AVERAGE(B, D, E)
-    # G = sv_smooth = AVERAGE(F[i], F[i+1])
-    # H = sv_smooth_env = (G[i] + G[i+1]) / 2
-    # I = sv_smooth_env_.97 = H * 0.97
-    if raw_sv_by_week:
-        # Get raw values as list (weeks 1-52)
-        B = [raw_sv_by_week.get(w, 0) for w in range(1, 53)]
-        
-        # C: sv_peak_env = MAX of 3 cells ending at current (looking back 2)
-        C = []
-        for i in range(52):
-            start = max(0, i - 2)
-            C.append(max(B[start:i+1]))
-        
-        # D: sv_peak_env_offset = (C[i] + C[i+1]) / 2
-        D = []
-        for i in range(52):
-            if i < 51:
-                D.append((C[i] + C[i+1]) / 2)
-            else:
-                D.append(C[i])  # Last row: just use C
-        
-        # E: sv_smooth_env = 3-row centered average of D
-        E = []
-        for i in range(52):
-            start = max(0, i - 1)
-            end = min(52, i + 2)
-            window = D[start:end]
-            E.append(sum(window) / len(window))
-        
-        # F: sv_final_curve = AVERAGE(B, D, E)
-        F = [(B[i] + D[i] + E[i]) / 3 for i in range(52)]
-        
-        # G: sv_smooth = 3-row centered average of F
-        # Excel formulas show:
-        # Week 1 (row 4): AVERAGE(F4:F5) = 2 values
-        # Week 2 (row 5): AVERAGE(F4:F6) = 3 values
-        # Week 3+ (row 6+): AVERAGE(F[i-1]:F[i+1]) = 3 values centered
-        G = []
-        for i in range(52):
-            if i == 0:
-                # Week 1: only 2 values (no F[-1])
-                G.append((F[0] + F[1]) / 2)
-            elif i == 51:
-                # Week 52: only 2 values (no F[52])
-                G.append((F[50] + F[51]) / 2)
-            else:
-                # Middle weeks: 3-value centered average
-                G.append((F[i-1] + F[i] + F[i+1]) / 3)
-        
-        # H: sv_smooth_env = (G[i] + G[i+1]) / 2
-        H = []
-        for i in range(52):
-            if i < 51:
-                H.append((G[i] + G[i+1]) / 2)
-            else:
-                H.append(G[i])
-        
-        # I: sv_smooth_env_.97 = H * 0.97
-        # J: seasonality_index = H / MAX(H) - normalized to peak
-        max_H = max(H) if H else 0
-        
-        # Only use per-product data if it has meaningful values (max_H > 0)
-        if max_H > 0:
-            for i in range(52):
-                week = i + 1
-                product_sv_by_week[week] = H[i] * 0.97
-            
-            # Store per-product seasonality_index (H / MAX(H))
-            product_seasonality_idx = {}
-            for i in range(52):
-                week = i + 1
-                product_seasonality_idx[week] = H[i] / max_H
-        else:
-            # Per-product data is all zeros, clear it to use global fallback
-            product_sv_by_week = {}
-            product_seasonality_idx = {}
-    else:
-        product_seasonality_idx = {}
-    
-    # Build GLOBAL seasonality lookups by week number (fallback when no per-product data)
-    sv_smooth_97_lookup = {}  # Column F fallback (sv_smooth_env_97)
-    seasonality_idx_lookup = {}  # Column I fallback (seasonality_index)
-    
-    for s in seasonality_data:
-        week_num = s.get('week_of_year', s.get('week_number', 0))
-        if week_num:
-            # Use sv_smooth_env_97 directly, or calculate from sv_smooth_env
-            sv_97 = s.get('sv_smooth_env_97', 0)
-            if not sv_97:
-                sv_97 = s.get('sv_smooth_env', 100) * 0.97
-            sv_smooth_97_lookup[week_num] = sv_97
-            seasonality_idx_lookup[week_num] = s.get('seasonality_index', 1.0)
-    
-    # Build vine claims lookup by (year, week) to avoid cross-year collisions
-    vine_lookup = {}
+    # Build vine claims list with parsed dates (same as 0-6m)
+    vine_claims_parsed = []
     for vc in vine_claims:
         claim_date = parse_date(vc.get('claim_date'))
         if claim_date:
-            iso_cal = claim_date.isocalendar()
-            key = (iso_cal[0], iso_cal[1])  # (year, week_number)
-            vine_lookup[key] = vine_lookup.get(key, 0) + (vc.get('units_claimed', 0) or 0)
+            vine_claims_parsed.append({
+                'date': claim_date,
+                'units': vc.get('units_claimed', 0) or 0
+            })
     
-    # Extract week dates and units (adjusted for vine claims)
-    week_dates = [parse_date(d.get('week_end')) for d in units_data]
-    units = []
+    # =========================================================================
+    # Build per-product sv_smooth_env_97 and seasonality_index using smoothing chain
+    # Keyword_Seasonality is per-product, calculated from sv_database
+    # Column I = sv_smooth_env_97, Column J = seasonality_index
+    # =========================================================================
+    seasonality_idx_lookup = {}
+    sv_smooth_env_97_lookup = {}
+    has_sv_data = False
+    
+    if product_search_volume:
+        # Build search volume by week
+        sv_by_week = {}
+        for sv in product_search_volume:
+            week_date = parse_date(sv.get('week_date'))
+            if week_date:
+                week_of_year = week_date.isocalendar()[1]
+                if week_of_year not in sv_by_week or week_date > parse_date(sv_by_week[week_of_year]['week_date']):
+                    sv_by_week[week_of_year] = sv
+        
+        if len(sv_by_week) >= 3:
+            has_sv_data = True
+            
+            # Build B array (52 weeks)
+            weeks = list(range(1, 53))
+            B = [sv_by_week.get(w, {}).get('search_volume', 0) or 0 for w in weeks]
+            n = len(B)
+            
+            # Apply smoothing chain (same as calculate_per_product_seasonality)
+            # C = MAX(OFFSET(B,-2,0,3))
+            C = [max(B[max(0, i-2):i+1]) for i in range(n)]
+            
+            # D = (C[i] + C[i+1])/2
+            D = [(C[i] + C[i+1])/2 if i < n-1 else C[i] for i in range(n)]
+            
+            # E = 3-row centered average of D
+            E = []
+            for i in range(n):
+                if i == 0:
+                    E.append((D[0] + D[1])/2 if n > 1 else D[0])
+                elif i == n-1:
+                    E.append((D[i-1] + D[i])/2)
+                else:
+                    E.append((D[i-1] + D[i] + D[i+1])/3)
+            
+            # F = AVERAGE(B, D, E)
+            F = [(B[i] + D[i] + E[i])/3 for i in range(n)]
+            
+            # G = 3-row centered average of F
+            G = []
+            for i in range(n):
+                if i == 0:
+                    G.append((F[0] + F[1])/2 if n > 1 else F[0])
+                elif i == n-1:
+                    G.append((F[i-1] + F[i])/2)
+                else:
+                    G.append((F[i-1] + F[i] + F[i+1])/3)
+            
+            # H = (G[i] + G[i+1])/2 (CURRENT+NEXT)
+            H = [(G[i] + G[i+1])/2 if i < n-1 else G[i] for i in range(n)]
+            
+            # Column I: sv_smooth_env_97 = H * 0.97
+            sv_smooth_env_97_values = [h * 0.97 for h in H]
+            
+            # Column J: seasonality_index = H / MAX(H), rounded to 2 decimals
+            max_H = max(H) if H else 1
+            if max_H <= 0:
+                max_H = 1
+            
+            for i, w in enumerate(weeks):
+                sv_smooth_env_97_lookup[w] = sv_smooth_env_97_values[i]
+                seasonality_idx_lookup[w] = round(H[i] / max_H, 2)
+    
+    # =========================================================================
+    # STEP 1: Calculate G values (Sales/SV = CVR) for historical data
+    # Excel: G = E/F where E=adj_units_sold, F=sv_smooth_env_97
+    # =========================================================================
+    G_values = []  # Sales/SV ratios (CVR)
+    
     for d in units_data:
-        raw_units = d.get('units', 0) or 0
         week_end = parse_date(d.get('week_end'))
-        if week_end and vine_lookup:
-            iso_cal = week_end.isocalendar()
-            key = (iso_cal[0], iso_cal[1])  # (year, week_number)
-            vine = vine_lookup.get(key, 0)
-            units.append(max(0, raw_units - vine))
+        if not week_end:
+            continue
+        
+        week_of_year = week_end.isocalendar()[1]
+        units = d.get('units', 0) or 0
+        
+        # Vine claims: sum claims within 6 days of week_end (same as 0-6m)
+        vine_units = sum(
+            v['units'] for v in vine_claims_parsed
+            if week_end - timedelta(days=6) <= v['date'] <= week_end
+        )
+        
+        # E = adj_units_sold = MAX(0, units - vine)
+        adj_units = max(0, units - vine_units)
+        
+        # F = sv_smooth_env_97 for this week
+        sv_smooth_env_97 = sv_smooth_env_97_lookup.get(week_of_year, 0)
+        
+        # G = E/F (Sales/SV ratio = CVR)
+        if sv_smooth_env_97 > 0:
+            G_values.append(adj_units / sv_smooth_env_97)
         else:
-            units.append(raw_units)
+            G_values.append(0)
     
-    # Column D: Get sv_smooth_env_97 for each week
-    # Excel: Keyword_Seasonality dynamically pulls per-ASIN data from sv_database
-    # Formula: =XLOOKUP(B3, Keyword_Seasonality!A:A, Keyword_Seasonality!I:I, "")
-    # Keyword_Seasonality!I is sv_smooth_env_.97 calculated from per-product sv_database
-    D_values = []
-    has_sv_data = bool(product_sv_by_week)  # True if product has sv_database data
-    
-    for d in units_data:
-        week_end = parse_date(d.get('week_end'))
-        if week_end:
-            week_of_year = week_end.isocalendar()[1]
-            # Use per-product smoothed SV if available, else 0 (needs data upload)
-            if product_sv_by_week and week_of_year in product_sv_by_week:
-                D_values.append(product_sv_by_week[week_of_year])
-            else:
-                D_values.append(0)
-        else:
-            D_values.append(0)
-    
-    # Column E: Conversion rate = C / D (sales / search volume)
-    E_values = []
-    for c, d in zip(units, D_values):
-        if d and d > 0 and c > 0:
-            E_values.append(c / d)
-        else:
-            E_values.append(0)
-    
-    # Extend E_values with zeros for future weeks (like Excel does)
-    # This ensures the 5-week window around peak includes zeros even at data edges
-    E_values_extended = E_values + [0] * 5
-    
-    # Column H: Average peak conversion rate (constant)
-    # Excel formula: =LET(maxVal, MAX(G:G), r, MATCH(maxVal, G:G, 0), AVERAGE(INDEX(G:G, r-2):INDEX(G:G, r+2)))
-    # where G = E/F = adj_units_sold / sv_smooth_env_97
-    # CRITICAL: Excel's AVERAGE includes zeros in the calculation!
-    
-    non_zero_E = [e for e in E_values_extended if e > 0]
-    if non_zero_E:
-        max_E = max(E_values_extended)  # Max from all E values
-        max_idx = E_values_extended.index(max_E)
-        # 5-week window around peak (Excel includes zeros!)
+    # =========================================================================
+    # STEP 2: Calculate H (avg peak CVR)
+    # Excel: =LET(maxVal, MAX(G:G), r, MATCH(maxVal, G:G, 0), AVERAGE(INDEX(G:G, r-2):INDEX(G:G, r+2)))
+    # Find the position of max G, then average G[r-2:r+2]
+    # =========================================================================
+    if G_values and any(g > 0 for g in G_values):
+        max_g = max(G_values)
+        max_idx = G_values.index(max_g)
+        
+        # Average of 5 values centered on max (r-2 to r+2)
         start_idx = max(0, max_idx - 2)
-        end_idx = min(len(E_values_extended), max_idx + 3)
-        window = E_values_extended[start_idx:end_idx]  # Include zeros like Excel
-        F_constant = sum(window) / len(window) if window else max_E
+        end_idx = min(len(G_values), max_idx + 3)  # +3 because range is exclusive
+        window = G_values[start_idx:end_idx]
+        
+        H_avg_peak_cvr = sum(window) / len(window) if window else 0
     else:
-        # No sales data - use 0, forecast will be 0
-        F_constant = 0
+        # Default if no valid G values (new product with no sales)
+        H_avg_peak_cvr = 0.0012  # Default to 0.12% CVR
     
-    # Column G: Get seasonality index for each week
-    # Excel: Keyword_Seasonality!J is seasonality_index = H / MAX(H) - per product
-    # Formula: =XLOOKUP(B4, Keyword_Seasonality!A:A, Keyword_Seasonality!J:J, "")
-    G_values = []
-    for d in units_data:
-        week_end = parse_date(d.get('week_end'))
-        if week_end:
-            week_of_year = week_end.isocalendar()[1]
-            # Use per-product seasonality_index if available
-            if product_seasonality_idx and week_of_year in product_seasonality_idx:
-                G_values.append(product_seasonality_idx[week_of_year])
-            else:
-                G_values.append(1.0)  # Neutral if no data
-        else:
-            G_values.append(1.0)
-    
-    # Column H: 25% weighted CVR = F × (1 + 0.25 × (G - 1))
-    H_values = []
-    for g in G_values:
-        H_values.append(F_constant * (1 + 0.25 * (g - 1)))
-    
-    # Column I: Forecast = D × H (search volume × adjusted CVR)
-    I_values = []
-    for d, h in zip(D_values, H_values):
-        I_values.append(d * h)
-    
-    # Extend into future weeks (beyond data)
-    last_date = week_dates[-1] if week_dates else today
-    extended_dates = list(week_dates)
-    extended_forecasts = list(I_values)
-    
-    # Add 104 weeks of future dates
-    for i in range(1, 105):
-        future_date = last_date + timedelta(days=7 * i)
-        if future_date not in extended_dates:
-            extended_dates.append(future_date)
-            
-            # Get per-product sv_smooth_env_97 for future week (cyclical by week_of_year)
-            week_of_year = future_date.isocalendar()[1]
-            if product_sv_by_week and week_of_year in product_sv_by_week:
-                d_val = product_sv_by_week[week_of_year]
-            else:
-                d_val = 0  # No data
-            
-            # Get per-product seasonality_index for future week
-            if product_seasonality_idx and week_of_year in product_seasonality_idx:
-                g_val = product_seasonality_idx[week_of_year]
-            else:
-                g_val = 1.0  # Neutral
-            
-            h_val = F_constant * (1 + 0.25 * (g_val - 1))
-            i_val = d_val * h_val
-            extended_forecasts.append(i_val)
-    
-    # Column J: Forecast for future weeks only
-    J_values = []
-    for week_end, forecast in zip(extended_dates, extended_forecasts):
-        if week_end and week_end > today:
-            J_values.append(forecast)
-        else:
-            J_values.append(0)
-    
-    # Calculate lead time
+    # =========================================================================
+    # STEP 3: Calculate lead time
+    # =========================================================================
     lead_time_days = (
         settings.get('amazon_doi_goal', 93) +
         settings.get('inbound_lead_time', 30) +
         settings.get('manufacture_lead_time', 7)
     )
     
-    # Weekly units needed
+    # =========================================================================
+    # STEP 4: Generate forecast for all weeks
+    # Excel: J = H$3 * (1 + 0.25 * (I - 1)) where I=seasonality_index
+    # K = F * J (sv_smooth_env_97 * weighted_cvr = units_sold_potential)
+    # L = IF(A > TODAY(), K, "") (forecast for future weeks only)
+    # Use Saturday-aligned dates like Google Sheets
+    # =========================================================================
+    extended_dates = []
+    extended_forecasts = []
+    
+    # Find the next Saturday (Google Sheets uses Saturday week-ends)
+    days_until_saturday = (5 - today.weekday()) % 7
+    if days_until_saturday == 0:
+        days_until_saturday = 7
+    first_saturday = today + timedelta(days=days_until_saturday)
+    
+    current_date = first_saturday
+    lead_time_end = today + timedelta(days=lead_time_days)
+    
+    while current_date <= lead_time_end + timedelta(days=365):  # Extend 1 year beyond lead time for DOI
+        week_of_year = current_date.isocalendar()[1]
+        
+        # F = sv_smooth_env_97 for this week
+        sv_smooth_env_97 = sv_smooth_env_97_lookup.get(week_of_year, 0)
+        
+        # I = seasonality_index for this week
+        seasonality_index = seasonality_idx_lookup.get(week_of_year, 1.0)
+        
+        # J = 25% weighted CVR = H * (1 + 0.25 * (I - 1))
+        # This adjusts the peak CVR by seasonality (25% weighting)
+        weighted_cvr = H_avg_peak_cvr * (1 + 0.25 * (seasonality_index - 1))
+        
+        # K = units_sold_potential = F * J (sv_smooth_env_97 * weighted_cvr)
+        units_sold_potential = sv_smooth_env_97 * weighted_cvr
+        
+        extended_dates.append(current_date)
+        extended_forecasts.append(units_sold_potential)
+        
+        current_date += timedelta(days=7)
+    
+    # Column L: Forecast for future weeks only
+    L_values = []
+    for week_end, forecast in zip(extended_dates, extended_forecasts):
+        if week_end and week_end > today:
+            L_values.append(forecast)
+        else:
+            L_values.append(0)
+    
+    # =========================================================================
+    # STEP 5: Calculate weekly units needed and units to make
+    # Excel Column Y: overlap calculation
+    # =========================================================================
     weekly_needed = calculate_weekly_units_needed(
-        J_values, extended_dates, today, lead_time_days
+        L_values, extended_dates, today, lead_time_days
     )
     
     # Get inventory values
     total_inventory = settings.get('total_inventory', 0)
     fba_available = settings.get('fba_available', 0)
     
-    # Units to make = MAX(0, SUM(weekly_needed) - inventory)
+    # Column AA: Units to make = MAX(0, SUM(weekly_needed) - inventory)
     units_to_make = calculate_units_to_make(weekly_needed, total_inventory)
     
-    # Calculate DOI using J values (future forecasts)
-    doi_total = calculate_doi(J_values, extended_dates, total_inventory, today)
-    doi_fba = calculate_doi(J_values, extended_dates, fba_available, today)
+    # Calculate DOI using L values (future forecasts)
+    doi_total = calculate_doi(L_values, extended_dates, total_inventory, today)
+    doi_fba = calculate_doi(L_values, extended_dates, fba_available, today)
     
     return {
         'units_to_make': units_to_make,
@@ -1157,7 +1099,7 @@ def calculate_forecast_6_18m(
         'runout_date_fba': doi_fba['runout_date'],
         'lead_time_days': lead_time_days,
         'total_units_needed': sum(weekly_needed),
-        'F_constant': F_constant,  # Peak conversion rate for debugging
+        'avg_peak_cvr': H_avg_peak_cvr,  # H value (avg peak CVR)
         'needs_seasonality': not has_sv_data,  # True if product needs sv_database upload
         'forecasts': [
             {
@@ -1165,7 +1107,7 @@ def calculate_forecast_6_18m(
                 'forecast': f,
                 'units_needed': w
             }
-            for d, f, w in zip(extended_dates, J_values, weekly_needed)
+            for d, f, w in zip(extended_dates, L_values, weekly_needed)
             if d and d >= today
         ][:52],
         'settings': settings
@@ -1174,27 +1116,134 @@ def calculate_forecast_6_18m(
 
 # =============================================================================
 # 0-6 MONTH FORECAST ALGORITHM (forecast_0m-6m sheet)
+# EXACT EXCEL FORMULA REPLICATION
 # =============================================================================
+
+def calculate_per_product_seasonality(product_sv: List[Dict]) -> Dict[int, float]:
+    """
+    Calculate per-product seasonality_index using the Keyword_Seasonality smoothing chain.
+    
+    Excel Smoothing Chain (EXACT):
+    B = search_volume (from sv_database)
+    C = sv_peak_env = MAX(OFFSET(B,-2,0,3)) - 3-row window max looking back
+    D = sv_peak_env_offset = (C[i] + C[i+1])/2
+    E = sv_smooth_env = AVERAGE(OFFSET(D,-1,0,3)) - 3-row centered average
+    F = sv_final_curve = AVERAGE(B,D,E)
+    G = sv_smooth = 3-row centered average of F
+    H = sv_smooth_env = (G[i] + G[i+1])/2 - uses CURRENT and NEXT, not previous!
+    J = seasonality_index = H / MAX(H)
+    
+    Returns: Dict mapping week_of_year to seasonality_index
+    """
+    if not product_sv:
+        return {}
+    
+    # Sort by week and extract search volumes by week_of_year
+    sv_by_week = {}
+    for sv in product_sv:
+        week_date = parse_date(sv.get('week_date'))
+        if week_date:
+            week_of_year = week_date.isocalendar()[1]
+            # Take the most recent value for each week_of_year
+            if week_of_year not in sv_by_week or week_date > parse_date(sv_by_week[week_of_year]['week_date']):
+                sv_by_week[week_of_year] = sv
+    
+    # Need at least some weeks
+    if len(sv_by_week) < 3:
+        return {}
+    
+    # Build array of 52 weeks (1-52)
+    weeks = list(range(1, 53))
+    B = []  # search_volume
+    for w in weeks:
+        if w in sv_by_week:
+            B.append(sv_by_week[w].get('search_volume', 0) or 0)
+        else:
+            B.append(0)
+    
+    n = len(B)
+    
+    # Column C: sv_peak_env = MAX(OFFSET(B,-2,0,3)) - max of rows from i-2 to i
+    C = []
+    for i in range(n):
+        start = max(0, i - 2)
+        window = B[start:i+1]
+        C.append(max(window) if window else 0)
+    
+    # Column D: sv_peak_env_offset = (C[i] + C[i+1])/2
+    D = []
+    for i in range(n):
+        if i < n - 1:
+            D.append((C[i] + C[i + 1]) / 2)
+        else:
+            D.append(C[i])
+    
+    # Column E: sv_smooth_env = AVERAGE(OFFSET(D,-1,0,3)) - 3-row centered average
+    E = []
+    for i in range(n):
+        if i == 0:
+            E.append((D[0] + D[1]) / 2 if n > 1 else D[0])
+        elif i == n - 1:
+            E.append((D[i-1] + D[i]) / 2)
+        else:
+            E.append((D[i-1] + D[i] + D[i+1]) / 3)
+    
+    # Column F: sv_final_curve = AVERAGE(B,D,E)
+    F = [(B[i] + D[i] + E[i]) / 3 for i in range(n)]
+    
+    # Column G: sv_smooth = 3-row centered average of F
+    G = []
+    for i in range(n):
+        if i == 0:
+            G.append((F[0] + F[1]) / 2 if n > 1 else F[0])
+        elif i == n - 1:
+            G.append((F[i-1] + F[i]) / 2)
+        else:
+            G.append((F[i-1] + F[i] + F[i+1]) / 3)
+    
+    # Column H: sv_smooth_env = (G[i] + G[i+1])/2 - CURRENT and NEXT!
+    H = []
+    for i in range(n):
+        if i < n - 1:
+            H.append((G[i] + G[i + 1]) / 2)
+        else:
+            H.append(G[i])
+    
+    # Column J: seasonality_index = H / MAX(H)
+    # Round to 2 decimal places to match Google Sheets display/storage
+    max_H = max(H) if H else 1
+    if max_H <= 0:
+        max_H = 1
+    
+    seasonality_lookup = {}
+    for i, w in enumerate(weeks):
+        # Round to 2 decimal places like Google Sheets
+        seasonality_lookup[w] = round(H[i] / max_H, 2)
+    
+    return seasonality_lookup
+
 
 def calculate_forecast_0_6m_exact(
     units_data: List[Dict],
     seasonality_data: List[Dict],
     vine_claims: List[Dict] = None,
     today: date = None,
-    settings: Dict = None
+    settings: Dict = None,
+    product_search_volume: List[Dict] = None
 ) -> Dict:
     """
     Calculate 0-6 month forecast exactly as Excel does.
     
-    Excel formula chain (forecast_0m-6m sheet):
-    C = units_sold
-    D = vine_units_claimed (for the week)
-    E = MAX(0, C - D) (adjusted units)
-    F = MAX(E:E) (peak adjusted units - constant)
-    G = seasonality_index (from Keyword_Seasonality!J)
-    H = peak_units × (G / current_seasonality)^0.65 (forecast with elasticity)
+    EXACT Excel formula chain (forecast_0m-6m sheet):
+    E = adj_units_sold = MAX(0, units_sold - vine_units)
+    F$3 = peak_units = MAX(E:E)  -- Maximum adjusted sales across all weeks
+    G = seasonality_index (per-product from sv_database smoothing chain)
+    idxNow = seasonality_index for the most recent historical week
     
-    Key insight: Uses peak sales scaled by seasonality with 0.65 elasticity
+    H (forecast) = peak_units × (G / idxNow)^0.65
+    
+    U = weekly_units_needed (overlap fraction calculation)
+    W = Units to Make = MAX(0, SUM(U) - Inventory)
     """
     if today is None:
         today = date.today()
@@ -1205,118 +1254,130 @@ def calculate_forecast_0_6m_exact(
     if vine_claims is None:
         vine_claims = []
     
-    if not units_data:
-        return {
-            'units_to_make': 0,
-            'doi_total_days': 0,
-            'doi_fba_days': 0,
-            'forecasts': [],
-            'settings': settings
-        }
+    if product_search_volume is None:
+        product_search_volume = []
     
-    # Build seasonality lookup (Column G)
-    seasonality_idx_lookup = {}
-    for s in seasonality_data:
-        week_num = s.get('week_of_year', s.get('week_number', 0))
-        if week_num:
-            seasonality_idx_lookup[week_num] = s.get('seasonality_index', 1.0)
-    
-    # Build vine claims lookup by (year, week) to avoid cross-year collisions
-    vine_lookup = {}
+    # Build vine claims list with parsed dates
+    # Excel formula D3: SUM(FILTER(vine, claim_date >= week_end-6 AND claim_date <= week_end))
+    vine_claims_parsed = []
     for vc in vine_claims:
         claim_date = parse_date(vc.get('claim_date'))
         if claim_date:
-            iso_cal = claim_date.isocalendar()
-            key = (iso_cal[0], iso_cal[1])  # (year, week_number)
-            vine_lookup[key] = vine_lookup.get(key, 0) + (vc.get('units_claimed', 0) or 0)
+            vine_claims_parsed.append({
+                'date': claim_date,
+                'units': vc.get('units_claimed', 0) or 0
+            })
     
-    # Extract week dates and units
-    week_dates = [parse_date(d.get('week_end')) for d in units_data]
-    units = [d.get('units', 0) or 0 for d in units_data]
+    # =========================================================================
+    # SEASONALITY: Per-product from sv_database via Keyword_Seasonality smoothing
+    # Excel: Keyword_Seasonality pulls sv_database filtered by ASIN, then calculates
+    # seasonality_index via smoothing chain. G3 XLOOKUPs that per-product result.
+    # =========================================================================
+    seasonality_idx_lookup = {}
     
-    # Column E: Adjusted units = units - vine_claims (minimum 0)
-    E_values = []
-    for i, d in enumerate(units_data):
+    if product_search_volume:
+        # Calculate per-product seasonality from sv_database using smoothing chain
+        seasonality_idx_lookup = calculate_per_product_seasonality(product_search_volume)
+    
+    # If no per-product SV data, product needs sv_database upload
+    has_sv_data = bool(seasonality_idx_lookup)
+    
+    # =========================================================================
+    # STEP 1: Calculate adj_units_sold (E) and find peak_units (F$3)
+    # E = MAX(0, units_sold - vine_units)
+    # F$3 = MAX(E:E)
+    # =========================================================================
+    adj_units_list = []
+    last_historical_week = None
+    last_historical_date = None
+    
+    for d in units_data:
         week_end = parse_date(d.get('week_end'))
-        if week_end:
-            iso_cal = week_end.isocalendar()
-            key = (iso_cal[0], iso_cal[1])  # (year, week_number)
-            vine = vine_lookup.get(key, 0)
-            adjusted = max(0, units[i] - vine)
-            E_values.append(adjusted)
-        else:
-            E_values.append(units[i])
+        if not week_end:
+            continue
+        
+        # Only consider historical weeks (before today)
+        if week_end >= today:
+            continue
+        
+        week_of_year = week_end.isocalendar()[1]
+        units = d.get('units', 0) or 0
+        
+        # D3: Sum vine claims where claim_date is within 6 days before week_end
+        # Excel: VALUE(vine_units_claimed!D:D) >= A3 - 6 AND VALUE(vine_units_claimed!D:D) <= A3
+        vine_units = sum(
+            v['units'] for v in vine_claims_parsed
+            if week_end - timedelta(days=6) <= v['date'] <= week_end
+        )
+        
+        # E = adj_units_sold = MAX(0, units - vine)
+        adj_units = max(0, units - vine_units)
+        adj_units_list.append(adj_units)
+        
+        # Track the most recent historical week for idxNow
+        if last_historical_date is None or week_end > last_historical_date:
+            last_historical_date = week_end
+            last_historical_week = week_of_year
     
-    # Column F: Peak adjusted units (constant)
-    F_peak = max(E_values) if E_values else 0
+    # F$3 = peak_units = MAX(E:E)
+    peak_units = max(adj_units_list) if adj_units_list else 0
     
-    # Find the current (last historical) seasonality index
-    # "lastRow" = last row before today
-    last_historical_idx = None
-    last_historical_seasonality = 1.0
-    for i, week_end in enumerate(week_dates):
-        if week_end and week_end < today:
-            last_historical_idx = i
+    # idxNow = seasonality_index for the current/most recent historical week
+    if last_historical_week:
+        idx_now = seasonality_idx_lookup.get(last_historical_week, 1.0)
+    else:
+        # Fallback to current week's seasonality
+        idx_now = seasonality_idx_lookup.get(today.isocalendar()[1], 1.0)
     
-    if last_historical_idx is not None and week_dates[last_historical_idx]:
-        last_week = week_dates[last_historical_idx]
-        week_of_year = last_week.isocalendar()[1]
-        last_historical_seasonality = seasonality_idx_lookup.get(week_of_year, 1.0)
-    
-    # Elasticity factor
-    ELASTICITY = 0.65
-    
-    # Column H: Forecast = peak × (seasonality / current_seasonality)^elasticity
-    # Only for future weeks within 12 months
-    H_values = []
-    twelve_months_out = today + timedelta(days=365)
-    
-    for i, week_end in enumerate(week_dates):
-        if week_end:
-            week_of_year = week_end.isocalendar()[1]
-            G_seasonality = seasonality_idx_lookup.get(week_of_year, 1.0)
-            
-            # Only calculate for future weeks within 12 months
-            if today <= week_end <= twelve_months_out:
-                if last_historical_seasonality > 0:
-                    ratio = G_seasonality / last_historical_seasonality
-                    forecast = max(0, F_peak * (ratio ** ELASTICITY))
-                else:
-                    forecast = F_peak
-                H_values.append(forecast)
-            else:
-                H_values.append(0)
-        else:
-            H_values.append(0)
-    
-    # Extend into future weeks
-    last_date = week_dates[-1] if week_dates else today
-    extended_dates = list(week_dates)
-    extended_forecasts = list(H_values)
-    
-    for i in range(1, 60):  # Add up to 60 weeks
-        future_date = last_date + timedelta(days=7 * i)
-        if future_date not in extended_dates and future_date <= twelve_months_out:
-            extended_dates.append(future_date)
-            
-            week_of_year = future_date.isocalendar()[1]
-            G_seasonality = seasonality_idx_lookup.get(week_of_year, 1.0)
-            
-            if last_historical_seasonality > 0:
-                ratio = G_seasonality / last_historical_seasonality
-                forecast = max(0, F_peak * (ratio ** ELASTICITY))
-            else:
-                forecast = F_peak
-            extended_forecasts.append(forecast)
-    
-    # Calculate lead time
+    # =========================================================================
+    # STEP 2: Calculate lead time
+    # =========================================================================
     lead_time_days = (
         settings.get('amazon_doi_goal', 93) +
         settings.get('inbound_lead_time', 30) +
         settings.get('manufacture_lead_time', 7)
     )
     
-    # Column U: Weekly units needed
+    # =========================================================================
+    # STEP 3: Generate forecast for future weeks
+    # H = peak_units × (G / idxNow)^0.65
+    # where G = future week's seasonality_index
+    # Google Sheets uses Saturday week-ends, so we align to Saturdays
+    # =========================================================================
+    ELASTICITY = 0.65  # From Excel formula
+    
+    extended_dates = []
+    extended_forecasts = []
+    
+    # Find the next Saturday (Google Sheets uses Saturday week-ends)
+    days_until_saturday = (5 - today.weekday()) % 7
+    if days_until_saturday == 0:
+        days_until_saturday = 7  # If today is Saturday, use next Saturday
+    first_saturday = today + timedelta(days=days_until_saturday)
+    
+    current_date = first_saturday
+    lead_time_end = today + timedelta(days=lead_time_days)
+    
+    while current_date <= lead_time_end + timedelta(days=365):
+        week_of_year = current_date.isocalendar()[1]
+        
+        # G = seasonality_index for this future week
+        future_seasonality = seasonality_idx_lookup.get(week_of_year, 1.0)
+        
+        # H = MAX(0, peak_units × POWER(G / idxNow, 0.65))
+        if idx_now > 0 and peak_units > 0:
+            forecast = max(0, peak_units * pow(future_seasonality / idx_now, ELASTICITY))
+        else:
+            forecast = 0
+        
+        extended_dates.append(current_date)
+        extended_forecasts.append(forecast)
+        
+        current_date += timedelta(days=7)
+    
+    # =========================================================================
+    # STEP 4: Calculate weekly units needed (overlap fraction)
+    # =========================================================================
     weekly_needed = calculate_weekly_units_needed(
         extended_forecasts, extended_dates, today, lead_time_days
     )
@@ -1325,7 +1386,7 @@ def calculate_forecast_0_6m_exact(
     total_inventory = settings.get('total_inventory', 0)
     fba_available = settings.get('fba_available', 0)
     
-    # Column W: Units to make = MAX(0, SUM(U) - Inventory)
+    # Units to Make = MAX(0, SUM(weekly_needed) - inventory)
     units_to_make = calculate_units_to_make(weekly_needed, total_inventory)
     
     # Calculate DOI
@@ -1340,8 +1401,8 @@ def calculate_forecast_0_6m_exact(
         'runout_date_fba': doi_fba['runout_date'],
         'lead_time_days': lead_time_days,
         'total_units_needed': sum(weekly_needed),
-        'F_peak': F_peak,  # Peak units for debugging
-        'last_seasonality': last_historical_seasonality,
+        'peak_units': peak_units,  # F$3 value
+        'idx_now': idx_now,  # Current seasonality
         'elasticity': ELASTICITY,
         'forecasts': [
             {
@@ -1368,7 +1429,8 @@ def generate_full_forecast(
     settings: Dict = None,
     today: date = None,
     algorithm: str = '18m+',
-    vine_claims: List[Dict] = None
+    vine_claims: List[Dict] = None,
+    product_search_volume: List[Dict] = None
 ) -> Dict:
     """
     Generate complete forecast using the exact Excel algorithms.
@@ -1378,6 +1440,7 @@ def generate_full_forecast(
     Args:
         algorithm: Which algorithm to use as primary ('0-6m', '6-18m', or '18m+')
         vine_claims: Optional vine claim data for 0-6m algorithm
+        product_search_volume: Optional per-product search volume data from sv_database
     """
     if today is None:
         today = date.today()
@@ -1388,14 +1451,17 @@ def generate_full_forecast(
     if vine_claims is None:
         vine_claims = []
     
+    if product_search_volume is None:
+        product_search_volume = []
+    
     # Add inventory to settings for the calculation
     settings['total_inventory'] = inventory.get('total_inventory', 0)
     settings['fba_available'] = inventory.get('fba_available', 0)
     
     # Calculate using all three algorithms
     result_18m = calculate_forecast_18m_plus(units_sold_data, today, settings)
-    result_6_18m = calculate_forecast_6_18m(units_sold_data, seasonality_data, today, settings)
-    result_0_6m = calculate_forecast_0_6m_exact(units_sold_data, seasonality_data, vine_claims, today, settings)
+    result_6_18m = calculate_forecast_6_18m(units_sold_data, seasonality_data, today, settings, vine_claims, product_search_volume)
+    result_0_6m = calculate_forecast_0_6m_exact(units_sold_data, seasonality_data, vine_claims, today, settings, product_search_volume)
     
     # Select primary result based on algorithm choice
     if algorithm == '0-6m':

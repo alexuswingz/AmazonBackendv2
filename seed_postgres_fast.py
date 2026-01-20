@@ -16,7 +16,7 @@ from sqlalchemy import create_engine, text
 from pathlib import Path
 
 # Configuration
-EXCEL_PATH = Path(__file__).parent.parent / 'V2.2 AutoForecast 1000 Bananas 2026.1.7 (5).xlsx'
+EXCEL_PATH = Path(__file__).parent.parent / 'V2.2 AutoForecast 1000 Bananas 2026.1.7 (8).xlsx'
 POSTGRES_URL = os.getenv('DATABASE_URL', '')
 
 if len(sys.argv) > 1:
