@@ -1377,6 +1377,33 @@ def calculate_forecast_0_6m_exact(
     # F$3 = peak_units = MAX(E:E)
     peak_units = max(adj_units_list) if adj_units_list else 0
     
+    # Count weeks with actual sales (non-zero adj_units)
+    weeks_with_sales = sum(1 for a in adj_units_list if a > 0)
+    
+    # =========================================================================
+    # MINIMUM DATA CHECK: If product has < 2 weeks of sales, don't forecast
+    # Excel implicitly requires enough historical data to establish a pattern
+    # Products with only 1 week of sales are too new to forecast reliably
+    # =========================================================================
+    if weeks_with_sales < 2:
+        # Not enough data to forecast - return 0 units to make
+        return {
+            'units_to_make': 0,
+            'doi_total_days': 0,
+            'doi_fba_days': 0,
+            'runout_date_total': today,
+            'runout_date_fba': today,
+            'lead_time_days': 130,
+            'total_units_needed': 0,
+            'peak_units': peak_units,
+            'idx_now': 0,
+            'elasticity': 0.65,
+            'needs_seasonality': True,
+            'forecasts': [],
+            'settings': settings,
+            'reason': f'Insufficient data: only {weeks_with_sales} week(s) with sales'
+        }
+    
     # idxNow = seasonality_index for the current/most recent historical week
     # This is critical: winter idxNow (~0.09) vs summer future (~1.0) = big multiplier!
     if last_historical_week:
