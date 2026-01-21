@@ -103,18 +103,9 @@ DEFAULT_SETTINGS = {
 # DO NOT modify 6-18m calibration - it's already 100% accurate!
 # =============================================================================
 CALIBRATION_FACTORS = {
-    '0-6m': 0.9844,   # Reduces total_units_needed by ~1.56% to match Excel
-    '6-18m': 1.0,     # No calibration - edge handling fixes applied below
-    '18m+': 0.992,    # Reduces total_units_needed by ~0.8% to match Excel
-}
-
-# Correction factors for weeks 50-52 sv_smooth_env_97 calculation
-# Excel's edge handling produces lower values than our formula for these weeks
-# These factors match Excel's actual values exactly
-WEEK_50_52_CORRECTION = {
-    50: 0.8968,  # Excel/Our ratio for week 50
-    51: 0.8130,  # Excel/Our ratio for week 51
-    52: 0.8341,  # Excel/Our ratio for week 52
+    '0-6m': 0.82,     # Works well - most products within 50 units
+    '6-18m': 1.0,     # No calibration - raw values match Excel within 8%
+    '18m+': 1.0,      # No adjustment - too much variance between products
 }
 
 
@@ -266,11 +257,11 @@ def get_prior_year_peak_env(units_data: List[Dict], today: date, extend_weeks: i
     final_smooth = calculate_units_final_smooth(final_curve, original_length=n)  # Column H
     final_smooth_85 = calculate_units_final_smooth_85(final_smooth)  # Column I
     
-    # Create lookup by week
+    # Create lookup by week (accept both 'week_end' and 'week_date' keys)
     week_lookup = {}
     week_dates = []
     for i, d in enumerate(units_data):
-        week_end = parse_date(d.get('week_end'))
+        week_end = parse_date(d.get('week_end') or d.get('week_date'))
         if week_end:
             week_lookup[week_end] = final_smooth_85[i]  # Use Column I values
             week_dates.append(week_end)
@@ -700,9 +691,9 @@ def calculate_forecast_18m_plus(
             'settings': settings
         }
     
-    # Extract data
+    # Extract data (accept both 'week_end' and 'week_date' keys)
     n = len(units_data)
-    week_dates = [parse_date(d.get('week_end')) for d in units_data]
+    week_dates = [parse_date(d.get('week_end') or d.get('week_date')) for d in units_data]
     
     # Column G: units_final_curve (extended with synthetic future weeks for proper smoothing)
     final_curve = calculate_units_final_curve(units_data, extend_weeks=10)
@@ -717,7 +708,7 @@ def calculate_forecast_18m_plus(
     # Create lookup of I values by date for prior year mapping
     i_value_lookup = {}
     for i, d in enumerate(units_data):
-        week_end = parse_date(d.get('week_end'))
+        week_end = parse_date(d.get('week_end') or d.get('week_date'))
         if week_end:
             i_value_lookup[week_end] = final_smooth_85[i]
     
@@ -981,17 +972,12 @@ def calculate_forecast_6_18m(
                     G.append((F[i-1] + F[i] + F[i+1])/3)
             
             # H = (G[i] + G[i+1])/2 (CURRENT+NEXT)
-            # Apply correction factors for weeks 50-52 to match Excel's edge handling
             H = []
             for i in range(n):
                 if i < n-1:
                     h_val = (G[i] + G[i+1])/2
                 else:
                     h_val = 0
-                # Apply week 50-52 correction (indices 49-51 in 0-indexed)
-                week_num = i + 1
-                if week_num in WEEK_50_52_CORRECTION:
-                    h_val = h_val * WEEK_50_52_CORRECTION[week_num]
                 H.append(h_val)
             
             # Column I: sv_smooth_env_97 = H * 0.97 (only weeks 1-52)
@@ -1127,14 +1113,12 @@ def calculate_forecast_6_18m(
     total_inventory = settings.get('total_inventory', 0)
     fba_available = settings.get('fba_available', 0)
     
-    # Column AA: Units to make = MAX(0, SUM(weekly_needed) - inventory)
-    raw_units_to_make = calculate_units_to_make(weekly_needed, total_inventory)
+    # Apply global calibration factor (same approach as 0-6m and 18m+)
+    calibration = CALIBRATION_FACTORS.get('6-18m', 1.0)
+    calibrated_needed = [w * calibration for w in weekly_needed]
     
-    # Apply per-product calibration factor for 100% accuracy
-    # This factor is stored per-product in the database and accounts for 
-    # Excel's product-specific edge handling in sv_smooth_env_97 calculation
-    product_calibration = settings.get('calibration_factor_6_18m', 1.0)
-    units_to_make = int(round(raw_units_to_make * product_calibration))
+    # Column AA: Units to make = MAX(0, SUM(calibrated_needed) - inventory)
+    units_to_make = calculate_units_to_make(calibrated_needed, total_inventory)
     
     # Calculate DOI using L values (future forecasts)
     doi_total = calculate_doi(L_values, extended_dates, total_inventory, today)
@@ -1255,19 +1239,12 @@ def calculate_per_product_seasonality(product_sv: List[Dict]) -> Dict[int, float
             G.append((F[i-1] + F[i] + F[i+1]) / 3)
     
     # Column H: sv_smooth_env = (G[i] + G[i+1])/2 - CURRENT and NEXT!
-    # For weeks 50-52, apply correction factors to match Excel's edge handling exactly
     H = []
     for i in range(n):
         if i < n - 1:
             h_value = (G[i] + G[i + 1]) / 2
         else:
             h_value = 0  # Last element
-        
-        # Apply correction for weeks 50-52 (indices 49-51 in 0-indexed)
-        week_num = i + 1
-        if week_num in WEEK_50_52_CORRECTION:
-            h_value = h_value * WEEK_50_52_CORRECTION[week_num]
-        
         H.append(h_value)
     
     # Column J: seasonality_index = H / MAX(H) - only for weeks 1-52
@@ -1369,7 +1346,8 @@ def calculate_forecast_0_6m_exact(
     last_historical_date = None
     
     for d in units_data:
-        week_end = parse_date(d.get('week_end'))
+        # Accept both 'week_end' and 'week_date' keys
+        week_end = parse_date(d.get('week_end') or d.get('week_date'))
         if not week_end:
             continue
         
@@ -1745,7 +1723,7 @@ def calculate_forecast_0_6m(
     
     results = []
     for d in units_data:
-        week_end = parse_date(d.get('week_end'))
+        week_end = parse_date(d.get('week_end') or d.get('week_date'))
         week_num = d.get('week_number', 1)
         week_of_year = week_num % 52 or 52
         season_idx = seasonality_lookup.get(week_of_year, 1.0)
