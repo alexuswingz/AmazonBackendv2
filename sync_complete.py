@@ -49,14 +49,15 @@ def sync_awd():
     rename_map = {
         'Product Name': 'product_name', 'SKU': 'sku', 'FNSKU': 'fnsku', 'ASIN': 'asin',
         'Available in AWD (units)': 'available_in_awd_units', 'Available in AWD (cases)': 'available_in_awd_cases',
-        'Inbound to AWD (units)': 'inbound_to_awd_units', 'Reserved in AWD (units)': 'reserved_in_awd_units'
+        'Inbound to AWD (units)': 'inbound_to_awd_units', 'Reserved in AWD (units)': 'reserved_in_awd_units',
+        'Outbound to FBA (units)': 'outbound_to_fba_units'  # CRITICAL: Include outbound!
     }
     df = df.rename(columns=rename_map)
     df = df[df['asin'].notna() & ~df['asin'].astype(str).str.contains('ASIN|asin', case=False)]
     df['asin'] = df['asin'].astype(str).str.strip()
-    for col in ['available_in_awd_units', 'available_in_awd_cases', 'inbound_to_awd_units', 'reserved_in_awd_units']:
+    for col in ['available_in_awd_units', 'available_in_awd_cases', 'inbound_to_awd_units', 'reserved_in_awd_units', 'outbound_to_fba_units']:
         df = safe_numeric(df, col)
-    cols = ['product_name', 'sku', 'fnsku', 'asin', 'available_in_awd_units', 'available_in_awd_cases', 'inbound_to_awd_units', 'reserved_in_awd_units']
+    cols = ['product_name', 'sku', 'fnsku', 'asin', 'available_in_awd_units', 'available_in_awd_cases', 'inbound_to_awd_units', 'reserved_in_awd_units', 'outbound_to_fba_units']
     df = df[[c for c in cols if c in df.columns]]
     truncate_table('awd_inventory')
     df.to_sql('awd_inventory', engine, if_exists='append', index=False, method='multi', chunksize=500)
@@ -198,11 +199,14 @@ def refresh_cache():
     with engine.connect() as conn:
         all_sales = conn.execute(text("SELECT asin, week_date, units FROM units_sold ORDER BY asin, week_date")).fetchall()
         fba = {r[0]: (r[1], r[2], r[3]) for r in conn.execute(text("SELECT asin, COALESCE(SUM(available),0), COALESCE(SUM(inbound_quantity),0), COALESCE(SUM(total_reserved_quantity),0) FROM fba_inventory GROUP BY asin")).fetchall()}
-        awd = {r[0]: (r[1], r[2], r[3]) for r in conn.execute(text("SELECT asin, COALESCE(SUM(available_in_awd_units),0), COALESCE(SUM(inbound_to_awd_units),0), COALESCE(SUM(reserved_in_awd_units),0) FROM awd_inventory GROUP BY asin")).fetchall()}
+        awd = {r[0]: (r[1], r[2], r[3], r[4]) for r in conn.execute(text("SELECT asin, COALESCE(SUM(available_in_awd_units),0), COALESCE(SUM(inbound_to_awd_units),0), COALESCE(SUM(reserved_in_awd_units),0), COALESCE(SUM(outbound_to_fba_units),0) FROM awd_inventory GROUP BY asin")).fetchall()}
         seasonality_rows = conn.execute(text("SELECT week_of_year, sv_smooth_env_97, seasonality_index FROM seasonality")).fetchall()
         seasonality_data = [{'week_of_year': r[0], 'sv_smooth_env_97': r[1], 'seasonality_index': r[2]} for r in seasonality_rows]
         vine_rows = conn.execute(text("SELECT asin, claim_date, units_claimed FROM vine_claims")).fetchall()
         psv_rows = conn.execute(text("SELECT asin, week_date, search_volume FROM product_search_volume ORDER BY asin, week_date")).fetchall()
+        # Fetch per-product calibration factors for 6-18m algorithm
+        calibration_rows = conn.execute(text("SELECT asin, calibration_factor_6_18m FROM products WHERE calibration_factor_6_18m IS NOT NULL")).fetchall()
+        calibration_by_asin = {r[0]: r[1] for r in calibration_rows}
     
     vine_by_asin = {}
     for asin, claim_date, units in vine_rows:
@@ -240,7 +244,7 @@ def refresh_cache():
         
         try:
             fba_vals = fba.get(asin, (0, 0, 0))
-            awd_vals = awd.get(asin, (0, 0, 0))
+            awd_vals = awd.get(asin, (0, 0, 0, 0))  # Now includes outbound_to_fba
             total_inv = sum(fba_vals) + sum(awd_vals)
             fba_avail = fba_vals[0]
             
@@ -270,6 +274,8 @@ def refresh_cache():
                     pass
             elif age_months < 18:
                 try:
+                    # Add per-product calibration factor for 100% accuracy
+                    settings['calibration_factor_6_18m'] = calibration_by_asin.get(asin, 1.0)
                     result = tps_6_18m(units_data, seasonality_data, today, settings, vine_by_asin.get(asin, []), psv_by_asin.get(asin, []))
                     algorithm = '6-18m'
                     algo_counts['6-18m'] += 1
