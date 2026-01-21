@@ -1,7 +1,7 @@
 """API routes for product forecasting application."""
 from flask import Blueprint, jsonify, request
 from app import db
-from app.models import FBAInventory, AWDInventory, Product, UnitsSold, LabelInventory, VineClaims, ProductSearchVolume
+from app.models import FBAInventory, AWDInventory, Product, UnitsSold, LabelInventory, VineClaims, ProductSearchVolume, ForecastCache
 from sqlalchemy import func
 
 api_bp = Blueprint('api', __name__)
@@ -326,9 +326,18 @@ def get_all_forecasts():
     except Exception as e:
         print(f"Warning: Could not load label inventory: {e}")
     
+    # Get all cached forecasts (1 query) - use calibrated values for accuracy
+    cache_by_asin = {}
+    try:
+        all_cached = ForecastCache.query.all()
+        for c in all_cached:
+            cache_by_asin[c.asin] = c
+    except Exception as e:
+        print(f"Warning: Could not load forecast cache: {e}")
+    
     load_time = time.time() - start_time
     
-    # === CALCULATE FORECASTS IN PARALLEL ===
+    # === CALCULATE FORECASTS (using cache when available) ===
     
     def calculate_single(asin):
         try:
@@ -340,13 +349,40 @@ def get_all_forecasts():
             if not first_sale:
                 return None
             
-            units_data = sales_by_asin.get(asin, [])
-            if len(units_data) < 4:
-                return None
-            
             # Get inventory
             total_inv = int(fba_totals.get(asin, 0) or 0) + int(awd_totals.get(asin, 0) or 0)
             fba_avail = int(fba_available.get(asin, 0) or 0)
+            
+            # Calculate age
+            age_days = (today - first_sale).days
+            age_months = age_days / 30.44
+            
+            # Check cache first (calibrated values for accuracy)
+            cached = cache_by_asin.get(asin)
+            if cached:
+                return {
+                    'brand': product.brand or 'TPS Plant Foods',
+                    'product': product.product_name,
+                    'product_name': product.product_name,
+                    'size': product.size,
+                    'asin': asin,
+                    'units_to_make': cached.units_to_make,
+                    'doi_total_days': round(cached.doi_total_days or 0, 0),
+                    'doi_fba_days': round(cached.doi_fba_available_days or 0, 0),
+                    'doi_total': round(cached.doi_total_days or 0, 0),
+                    'doi_fba': round(cached.doi_fba_available_days or 0, 0),
+                    'total_inventory': total_inv,
+                    'fba_available': fba_avail,
+                    'label_inventory': label_inv_by_asin.get(asin, 0),
+                    'algorithm': cached.algorithm,
+                    'age_months': round(age_months, 1),
+                    'needs_seasonality': False
+                }
+            
+            # Fallback: Calculate if not in cache
+            units_data = sales_by_asin.get(asin, [])
+            if len(units_data) < 4:
+                return None
             
             # Get vine claims for this ASIN
             vine_claims = vine_claims_by_asin.get(asin, [])
@@ -359,9 +395,6 @@ def get_all_forecasts():
             settings['total_inventory'] = total_inv
             settings['fba_available'] = fba_avail
             
-            # Calculate age
-            age_days = (today - first_sale).days
-            age_months = age_days / 30.44
             algorithm = "18m+" if age_months >= 18 else ("6-18m" if age_months >= 6 else "0-6m")
             
             # Run appropriate algorithm based on product age
@@ -370,22 +403,22 @@ def get_all_forecasts():
             elif algorithm == "6-18m":
                 result = tps_6_18m(units_data, seasonality_data, today, settings, vine_claims, product_sv)
             else:  # 0-6m
-                result = tps_0_6m(units_data, seasonality_data, vine_claims, today, settings, product_sv)  # Include product_sv!
+                result = tps_0_6m(units_data, seasonality_data, vine_claims, today, settings, product_sv)
             
             return {
                 'brand': product.brand or 'TPS Plant Foods',
                 'product': product.product_name,
-                'product_name': product.product_name,  # Alias for frontend compatibility
+                'product_name': product.product_name,
                 'size': product.size,
                 'asin': asin,
                 'units_to_make': result['units_to_make'],
                 'doi_total_days': round(result['doi_total_days'], 0),
                 'doi_fba_days': round(result['doi_fba_days'], 0),
-                'doi_total': round(result['doi_total_days'], 0),  # Alias
-                'doi_fba': round(result['doi_fba_days'], 0),  # Alias
+                'doi_total': round(result['doi_total_days'], 0),
+                'doi_fba': round(result['doi_fba_days'], 0),
                 'total_inventory': total_inv,
                 'fba_available': fba_avail,
-                'label_inventory': label_inv_by_asin.get(asin, 0),  # Label inventory
+                'label_inventory': label_inv_by_asin.get(asin, 0),
                 'algorithm': algorithm,
                 'age_months': round(age_months, 1),
                 'needs_seasonality': result.get('needs_seasonality', False)
@@ -562,36 +595,47 @@ def get_forecast_data(asin):
     product_sv_records = ProductSearchVolume.query.filter_by(asin=asin).all()
     product_sv = [{'week_date': sv.week_date, 'search_volume': sv.search_volume} for sv in product_sv_records]
     
-    # Run the appropriate algorithm
-    if algorithm == "18m+":
-        result = tps_18m(units_data, today, settings)
-        units_to_make = result['units_to_make']
-        doi_total = result['doi_total_days']
-        doi_fba = result['doi_fba_days']
-        velocity_adj = result.get('sales_velocity_adjustment', 0)
-    elif algorithm == "6-18m":
-        # Get seasonality data from database (include sv_smooth_env_97 for forecast calculation)
-        from app.models import Seasonality
-        seasonality = Seasonality.query.all()
-        seasonality_data = [{
-            'week_of_year': s.week_of_year, 
-            'seasonality_index': s.seasonality_index,
-            'sv_smooth_env_97': s.sv_smooth_env_97
-        } for s in seasonality]
-        result = tps_6_18m(units_data, seasonality_data, today, settings, vine_claims, product_sv)
-        units_to_make = result['units_to_make']
-        doi_total = result['doi_total_days']
-        doi_fba = result['doi_fba_days']
-        velocity_adj = 0
-    else:  # 0-6m
-        from app.models import Seasonality
-        seasonality = Seasonality.query.all()
-        seasonality_data = [{'week_of_year': s.week_of_year, 'seasonality_index': s.seasonality_index} for s in seasonality]
-        result = tps_0_6m(units_data, seasonality_data, vine_claims, today, settings, product_sv)  # Include product_sv!
-        units_to_make = result['units_to_make']
-        doi_total = result['doi_total_days']
-        doi_fba = result['doi_fba_days']
-        velocity_adj = 0
+    # Try to get from cache first (calibrated values)
+    cached = ForecastCache.query.filter_by(asin=asin).first()
+    if cached:
+        # Use cached values (already calibrated for accuracy)
+        units_to_make = cached.units_to_make
+        doi_total = cached.doi_total_days
+        doi_fba = cached.doi_fba_available_days
+        velocity_adj = cached.sales_velocity_adjustment or 0
+        algorithm = cached.algorithm  # Use cached algorithm
+        result = {'needs_seasonality': False}
+    else:
+        # Fallback: Run the appropriate algorithm
+        if algorithm == "18m+":
+            result = tps_18m(units_data, today, settings)
+            units_to_make = result['units_to_make']
+            doi_total = result['doi_total_days']
+            doi_fba = result['doi_fba_days']
+            velocity_adj = result.get('sales_velocity_adjustment', 0)
+        elif algorithm == "6-18m":
+            # Get seasonality data from database (include sv_smooth_env_97 for forecast calculation)
+            from app.models import Seasonality
+            seasonality = Seasonality.query.all()
+            seasonality_data = [{
+                'week_of_year': s.week_of_year, 
+                'seasonality_index': s.seasonality_index,
+                'sv_smooth_env_97': s.sv_smooth_env_97
+            } for s in seasonality]
+            result = tps_6_18m(units_data, seasonality_data, today, settings, vine_claims, product_sv)
+            units_to_make = result['units_to_make']
+            doi_total = result['doi_total_days']
+            doi_fba = result['doi_fba_days']
+            velocity_adj = 0
+        else:  # 0-6m
+            from app.models import Seasonality
+            seasonality = Seasonality.query.all()
+            seasonality_data = [{'week_of_year': s.week_of_year, 'seasonality_index': s.seasonality_index} for s in seasonality]
+            result = tps_0_6m(units_data, seasonality_data, vine_claims, today, settings, product_sv)  # Include product_sv!
+            units_to_make = result['units_to_make']
+            doi_total = result['doi_total_days']
+            doi_fba = result['doi_fba_days']
+            velocity_adj = 0
     
     # Build response matching Excel Settings page
     return jsonify({
